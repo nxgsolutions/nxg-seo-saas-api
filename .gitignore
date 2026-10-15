@@ -1,0 +1,15 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+.env
+.pytest_cache/
+.mypy_cache/
+*.log
+
+# Local DB dumps / data exports — never commit (seed .sql files under scripts/ are kept)
+db_backup/
+backups/
+*.dump

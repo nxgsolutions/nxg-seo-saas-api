@@ -1,0 +1,46 @@
+# Production backend + Postgres, self-contained inside the backend repo so it
+# ships when you pull only this repo (e.g. into myprojects/seo/backend on the
+# AWS server). The frontend is deployed separately (Vercel).
+#
+#   docker compose -f docker-compose.prod.yml up -d --build
+#
+# Postgres is NOT exposed to the host — only the backend reaches it over the
+# compose network. Data persists in the named `pgdata` volume across restarts.
+services:
+  db:
+    image: postgres:18
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-root}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-root}
+      POSTGRES_DB: ${POSTGRES_DB:-seo_saas}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-root} -d ${POSTGRES_DB:-seo_saas}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  backend:
+    build: .
+    restart: unless-stopped
+    # App config / secrets come from .env (create it from .env.example on the
+    # server — it is gitignored and never committed).
+    env_file:
+      - .env
+    environment:
+      # Always point the app at the compose Postgres service, overriding
+      # whatever DATABASE_URL is in .env.
+      DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:-root}:${POSTGRES_PASSWORD:-root}@db:5432/${POSTGRES_DB:-seo_saas}
+      WEB_CONCURRENCY: "2"
+    depends_on:
+      db:
+        condition: service_healthy
+    ports:
+      # Exposes the API on the host's port 8000. Put Nginx/Caddy in front for
+      # HTTPS in production (see DEPLOY.md).
+      - "8000:8000"
+
+volumes:
+  pgdata:
