@@ -106,6 +106,29 @@ def test_add_domain_bare_domain_with_name(client: TestClient) -> None:
     assert resp.json()["name"] == "Main Site"
 
 
+def test_add_domain_with_category_links_it(client: TestClient) -> None:
+    _signup(client)
+    wid = _default_workspace_id(client)
+    cat = client.post("/api/categories", json={"name": "Real Estate"})
+    assert cat.status_code in (200, 201)
+    cat_id = cat.json()["id"]
+
+    resp = client.post(
+        f"{WORKSPACES_URL}/{wid}/domains",
+        json={"url": "realty.example", "category_id": cat_id},
+    )
+    assert resp.status_code == 201
+    assert resp.json()["category_id"] == cat_id
+
+
+def test_add_domain_without_category_is_uncategorized(client: TestClient) -> None:
+    _signup(client)
+    wid = _default_workspace_id(client)
+    resp = client.post(f"{WORKSPACES_URL}/{wid}/domains", json={"url": "nocat.example"})
+    assert resp.status_code == 201
+    assert resp.json()["category_id"] is None
+
+
 def test_add_domain_invalid_domain_422(client: TestClient) -> None:
     _signup(client)
     wid = _default_workspace_id(client)

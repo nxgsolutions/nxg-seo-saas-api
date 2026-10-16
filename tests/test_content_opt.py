@@ -45,6 +45,53 @@ def test_extract_ignores_page_chrome() -> None:
     assert f["reading_ease"] is not None
 
 
+def test_extract_h1_inside_header() -> None:
+    # Many CMS templates wrap the article H1 in a <header> (entry-header);
+    # the H1 must still be found even though page chrome is stripped.
+    html = ("<html><head><title>T</title></head><body><nav><a href='/'>Home</a></nav>"
+            "<article><header class='entry-header'><h1>UPSC CSE syllabus</h1></header>"
+            f"<p>{FILLER}</p></article><footer>Copyright</footer></body></html>")
+    f = content_score.extract(html, "https://site.com/upsc-cse-syllabus")
+    assert f["h1"] == ["UPSC CSE syllabus"]
+
+
+def test_extract_h1_outside_first_article() -> None:
+    # Index/listing pages: the first <article> is a card without the page H1,
+    # which lives in <main> (or a page <header>). It must still be found.
+    html = ("<html><head><title>T</title></head><body>"
+            "<main><div><h1>UPSC Civil Services Current Affairs</h1></div>"
+            f"<article><h2>Card</h2><p>{FILLER}</p></article></main>"
+            "<footer>Copyright</footer></body></html>")
+    f = content_score.extract(html, "https://site.com/upsc-current-affairs")
+    assert f["h1"] == ["UPSC Civil Services Current Affairs"]
+
+
+def test_extract_listing_page_uses_main_not_one_card() -> None:
+    # An index page: several small <article> cards inside <main>. No single
+    # article dominates, so metrics must cover <main>, not just the first card.
+    cards = "".join(f"<article><h2>Card {i}</h2><p>Short card blurb number {i}.</p></article>" for i in range(5))
+    body = " ".join(["The page body explains the topic in depth with real guidance."] * 30)
+    html = (f"<html><head><title>Index</title></head><body><nav>Menu</nav>"
+            f"<main><h1>Topic hub</h1><p>{body}</p>{cards}</main></body></html>")
+    f = content_score.extract(html, "https://site.com/hub")
+    assert f["h1"] == ["Topic hub"]
+    assert f["word_count"] > 200  # the whole main, not a single ~5-word card
+    assert len(f["headings"]) == 5  # every card's H2 counted
+
+
+def test_extract_dominant_article_ignores_sidebar() -> None:
+    # A real article page: the <article> dominates, so a sibling card in <main>
+    # is not counted in the article's metrics.
+    article_body = " ".join(["This article covers the subject thoroughly and clearly."] * 60)
+    html = ("<html><head><title>Post</title></head><body><main>"
+            f"<article><h1>The Post</h1><p>{article_body}</p></article>"
+            "<article><h2>Related</h2><p>Tiny related blurb.</p></article>"
+            "</main></body></html>")
+    f = content_score.extract(html, "https://site.com/post")
+    assert f["h1"] == ["The Post"]
+    assert "Related" not in [h["text"] for h in f["headings"]]
+
+
 def test_score_is_deterministic_and_keyword_aware() -> None:
     good = content_score.extract(_html(
         "UPSC study plan: a 12-month schedule", "UPSC study plan", "UPSC study plan tips. " + FILLER,

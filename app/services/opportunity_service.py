@@ -517,6 +517,24 @@ def refresh_competitor_analytics(
             "refresh": summary}
 
 
+def warm_competitor_backlinks(
+    db: Session, domain: Domain, *, country: str = domain_analytics_service.DEFAULT_COUNTRY,
+    language: str = "en", force: bool = False,
+) -> dict:
+    """Cheap backlinks-only warm-up for OUR domain + its competitors.
+
+    Fills the Authority / Backlinks / Referring-domains columns used by the
+    Keyword Breakdown, without buying the whole-site Labs traffic overview.
+    Returns {fetched, cached, failed, error}.
+    """
+    host = _norm_host(domain.domain)
+    targets = [host, *(c["domain"] for c in strategy(db, domain)["competitors"])]
+    return domain_analytics_service.warm_backlinks(
+        db, targets, location_code=domain_analytics_service.location_code_for(country),
+        language=language, force=force, env=data_env.env_for_domain(db, domain),
+    )
+
+
 def competitor_keywords(
     db: Session, domain: Domain, competitor: str, *, kind: str = "all",
 ) -> dict:

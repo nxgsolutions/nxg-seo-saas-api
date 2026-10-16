@@ -12,6 +12,7 @@ from app.models.backlink import (
     BacklinkRun,
 )
 from app.models.billing import Plan, Subscription
+from app.models.category import Category
 from app.models.competitor import CompetitorRankSnapshot, TrackedCompetitor
 from app.models.opportunity import (
     OpportunityKeyword,
@@ -59,6 +60,7 @@ __all__ = [
     "Workspace",
     "WorkspaceMember",
     "Domain",
+    "Category",
     "PageAudit",
     "SitePage",
     "PageSnapshot",

@@ -76,6 +76,15 @@ def scope_filters(scope: str, topic_regex: str | None = None) -> list | None:
     return parts
 
 
+def scope_max_keywords(scope: str) -> int:
+    """Hard cap on keywords per fetch for a multi-page scope. 'relevant' has a
+    tighter cap so a single opportunity fetch stays cheap; 'all' keeps the
+    larger shared cap (still reachable from scripts / sandbox, not the UI)."""
+    if scope == "relevant":
+        return settings.DATAFORSEO_RELEVANT_MAX_KEYWORDS
+    return settings.DATAFORSEO_RANKED_MAX_KEYWORDS_PER_FETCH
+
+
 def pages_cost(n_keywords: int, env: str) -> tuple[int, float]:
     """(requests, USD) to fetch n keywords in 1000-keyword pages."""
     if n_keywords <= 0:
@@ -216,7 +225,7 @@ def estimate(
     if scope == "top":
         to_fetch = min(matching, clamp_limit(None))
     else:
-        to_fetch = min(matching, settings.DATAFORSEO_RANKED_MAX_KEYWORDS_PER_FETCH,
+        to_fetch = min(matching, scope_max_keywords(scope),
                        affordable_keywords(settings.DATAFORSEO_RANKED_MAX_COST_PER_FETCH, env))
     requests, cost = pages_cost(to_fetch, env)
     full_requests, full_cost = pages_cost(matching, env)
@@ -260,8 +269,8 @@ def fetch(
     if scope == "top":
         cap = clamp_limit(limit)
     else:
-        cap = min(max_keywords or settings.DATAFORSEO_RANKED_MAX_KEYWORDS_PER_FETCH,
-                  settings.DATAFORSEO_RANKED_MAX_KEYWORDS_PER_FETCH)
+        scope_cap = scope_max_keywords(scope)
+        cap = min(max_keywords or scope_cap, scope_cap)
     budget = settings.DATAFORSEO_RANKED_MAX_COST_PER_FETCH
     cap = min(cap, affordable_keywords(budget, env)) if scope != "top" else cap
 
@@ -366,7 +375,7 @@ def _filter_rows(rows: list[dict], *, q: str, bucket: str, show: str, url: str |
             continue
         if url and r["url"] != url:
             continue
-        if q and q not in r["keyword"].lower() and q not in (r["url"] or "").lower():
+        if q and q not in r["keyword"].lower():
             continue
         out.append(r)
     return out

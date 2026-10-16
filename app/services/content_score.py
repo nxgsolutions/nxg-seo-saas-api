@@ -88,6 +88,25 @@ def _host(url: str) -> str:
 
 # ── Extraction ──────────────────────────────────────────────────────────────
 
+def _content_root(soup: BeautifulSoup):
+    """The element the page's content lives in, measured after chrome is removed.
+
+    Prefers the <article> that dominates the page (a real article page), so a
+    blog post's related/sidebar markup isn't counted. When no single <article>
+    dominates — e.g. an index/listing page whose <article>s are small cards —
+    it uses <main> (or <body>), so word count and headings reflect the whole
+    page body instead of one card.
+    """
+    body = soup.body or soup
+    body_len = len(body.get_text(" ", strip=True)) or 1
+    articles = soup.find_all("article")
+    if articles:
+        biggest = max(articles, key=lambda a: len(a.get_text(" ", strip=True)))
+        if len(biggest.get_text(" ", strip=True)) >= 0.5 * body_len:
+            return biggest
+    return soup.find("main") or body
+
+
 def extract(html: str, url: str) -> dict[str, Any]:
     """Pull the on-page facts the checks and the comparison need."""
     soup = BeautifulSoup(html or "", "html.parser")
@@ -99,11 +118,23 @@ def extract(html: str, url: str) -> dict[str, Any]:
     # Everything below is measured on the article only — menus, headers and
     # footers are removed so site-wide links and boilerplate don't count.
     host = _host(url)
+
+    # The main heading is read BEFORE chrome is stripped, because templates often
+    # wrap the <h1> in a <header> (e.g. an "entry-header") that the chrome removal
+    # below would delete. The content region is tried first (so a site-masthead
+    # H1 isn't preferred), then the whole document — the real H1 may sit in a
+    # page-level header or outside the first <article>/<main> (e.g. index pages
+    # whose first <article> is a card, not the page body).
+    def _h1_texts(node: Any) -> list[str]:
+        return [t for t in (h.get_text(" ", strip=True).replace("¶", "").strip()
+                            for h in node.find_all("h1")) if t]
+
+    content_root = soup.find("article") or soup.find("main") or soup.body or soup
+    h1 = _h1_texts(content_root) or _h1_texts(soup)
+
     for tag in soup(_CHROME):
         tag.decompose()
-    root = soup.find("article") or soup.find("main") or soup.body or soup
-
-    h1 = [h.get_text(" ", strip=True).replace("¶", "").strip() for h in root.find_all("h1")]
+    root = _content_root(soup)
     headings = [
         {"level": int(h.name[1]), "text": h.get_text(" ", strip=True).replace("¶", "").strip()[:200]}
         for h in root.find_all(["h2", "h3"]) if h.get_text(strip=True)
@@ -161,7 +192,7 @@ def article_html(html: str) -> str:
     soup = BeautifulSoup(html or "", "html.parser")
     for tag in soup(_CHROME):
         tag.decompose()
-    root = soup.find("article") or soup.find("main") or soup.body or soup
+    root = _content_root(soup)
     inner = root.decode_contents() if hasattr(root, "decode_contents") else str(root)
     return re.sub(r"\n{3,}", "\n\n", inner).strip()
 

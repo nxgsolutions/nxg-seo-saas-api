@@ -22,7 +22,7 @@ import logging
 import re
 from datetime import date, datetime, timezone
 
-from sqlalchemy import func, select
+from sqlalchemy import and_, exists, func, select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.orm import Session
 
@@ -37,7 +37,9 @@ from app.models.keyword_analysis import (
     SerpSnapshot,
     SerpSnapshotItem,
 )
+from app.models.category import Category
 from app.models.domain import Domain
+from app.models.saved_keyword import SavedKeyword
 from app.models.workspace import Workspace
 from app.core.config import settings
 from app.db.session import SessionLocal
@@ -46,6 +48,7 @@ from app.services import (
     data_env,
     dataforseo_client,
     domain_analytics_service,
+    domain_settings,
     gsc_service,
     keyword_planner_service,
     keyword_scoring,
@@ -87,7 +90,11 @@ def _upsert_keyword(db: Session, keyword: str) -> Keyword:
 def _upsert_domain_keyword(
     db: Session, domain: Domain, keyword: Keyword, country: str, language: str
 ) -> DomainKeyword:
-    """Link a global keyword to a domain at a locale (per-domain targeting)."""
+    """Link a global keyword to a domain at a locale (per-domain targeting).
+
+    The link inherits the domain's category so SERP-derived competitors can be
+    scoped to one industry; kept in sync on conflict if the domain's category
+    changed since the link was first written."""
     stmt = (
         pg_insert(DomainKeyword)
         .values(
@@ -95,10 +102,11 @@ def _upsert_domain_keyword(
             keyword_id=keyword.id,
             country_code=country,
             language_code=language,
+            category_id=domain.category_id,
         )
         .on_conflict_do_update(
             constraint="uq_domain_keyword",
-            set_={"domain_id": domain.id},  # no-op set so RETURNING yields the row
+            set_={"category_id": domain.category_id},
         )
         .returning(DomainKeyword.id)
     )
@@ -873,6 +881,96 @@ _NON_COMPETITOR_HOSTS = (
     "amazon.", "play.google", "apps.apple", "gov.in", ".gov", "cdn-", "cdn.",
 )
 
+# Streaming / movie / music hosts that surface for ambiguous keywords (e.g. a
+# course brand that is also a show title) but are never SEO competitors — UNLESS
+# the domain is itself an entertainment niche (see _is_entertainment_domain).
+# Substring match on the host.
+_ENTERTAINMENT_HOSTS = (
+    "imdb.", "primevideo.", "tv.apple", "justwatch.", "netflix.", "hotstar.",
+    "jiocinema.", "disneyplus.", "hulu.", "zee5.", "sonyliv.", "mxplayer.",
+    "spotify.", "rottentomatoes.", "letterboxd.", "themoviedb.", "tvguide.",
+    "bookmyshow.", "paramountplus.", "max.com",
+)
+
+# Words in a domain's category or topic terms that mark it as an entertainment
+# niche, for which the hosts above ARE legitimate competitors.
+_ENTERTAINMENT_SIGNALS = (
+    "movie", "film", "stream", "cinema", "tv show", "web series", "series",
+    "music", "entertainment", "ott", "watch online", "box office", "showtime",
+)
+
+
+def _is_entertainment_domain(db: Session, domain: Domain) -> bool:
+    """True when the domain's category or topic terms indicate an entertainment
+    niche, so streaming/movie hosts should be kept as real competitors."""
+    hay: list[str] = []
+    cat_id = getattr(domain, "category_id", None)
+    if cat_id:
+        cat = db.get(Category, cat_id)
+        if cat:
+            hay.append(f"{cat.name} {cat.slug}".lower())
+    hay.append((getattr(domain, "topic_terms", None) or "").lower())
+    text = " ".join(hay)
+    return any(sig in text for sig in _ENTERTAINMENT_SIGNALS)
+
+
+def _on_topic(keyword: str, topic_regex: str | None) -> bool:
+    """Whether a keyword's text matches the domain's topic terms. No topic
+    configured (topic_regex is None) ⇒ everything is on-topic. Also checks the
+    compact form so "u.p.s.c mock test" matches a "upsc" topic term."""
+    if not topic_regex:
+        return True
+    compact = re.sub(r"[^a-z0-9]", "", keyword.lower())
+    return (re.search(topic_regex, keyword, re.I) is not None
+            or re.search(topic_regex, compact) is not None)
+
+
+def _workspace_keyword_ids(db: Session, workspace_id) -> set:
+    """Every keyword this workspace has worked on — the isolation boundary for
+    competitor suggestions. SERP snapshots are keyed to global keywords, not to a
+    workspace, so a keyword "belongs" to a workspace when the workspace has
+    targeted it (domain_keywords), saved it (saved_keywords), or researched it
+    (a keyword_research seed or result). domain_keywords alone is too narrow —
+    many researched keywords with SERP data are never written there."""
+    ids: set = set()
+    ids.update(db.execute(
+        select(DomainKeyword.keyword_id)
+        .join(Domain, Domain.id == DomainKeyword.domain_id)
+        .where(Domain.workspace_id == workspace_id)
+    ).scalars())
+    ids.update(
+        kid for kid in db.execute(
+            select(SavedKeyword.keyword_id)
+            .join(Domain, Domain.id == SavedKeyword.domain_id)
+            .where(Domain.workspace_id == workspace_id)
+        ).scalars() if kid
+    )
+    ids.update(
+        kid for kid in db.execute(
+            select(KeywordResearch.seed_keyword_id)
+            .where(KeywordResearch.workspace_id == workspace_id)
+        ).scalars() if kid
+    )
+    ids.update(db.execute(
+        select(KeywordResearchResult.keyword_id)
+        .join(KeywordResearch, KeywordResearch.id == KeywordResearchResult.research_id)
+        .where(KeywordResearch.workspace_id == workspace_id)
+    ).scalars())
+    return ids
+
+
+def _category_keyword_ids(db: Session, workspace_id, category_id) -> set:
+    """Keywords tagged with a category (via domain_keywords) in this workspace.
+    Category only lives on domain_keywords, so this can be empty even when the
+    workspace has plenty of researched keywords — callers fall back to the full
+    workspace set when it is."""
+    return set(db.execute(
+        select(DomainKeyword.keyword_id)
+        .join(Domain, Domain.id == DomainKeyword.domain_id)
+        .where(Domain.workspace_id == workspace_id,
+               DomainKeyword.category_id == category_id)
+    ).scalars())
+
 
 def competitor_domains(
     db: Session,
@@ -888,9 +986,31 @@ def competitor_domains(
     those keywords they appear for (share of voice) and how well they rank.
 
     Read-only. Your own domain, search engines, social/video, the official exam
-    body and CDNs are excluded. Empty until serp_snapshots has data."""
+    body and CDNs are excluded. Empty until serp_snapshots has data.
+
+    Scoped to this domain's WORKSPACE: a SERP keyword only counts when the
+    workspace has worked on it — targeted (domain_keywords), saved
+    (saved_keywords) or researched (a keyword_research seed/result). SERP
+    snapshots aren't workspace-bound, so without this an uncategorized domain
+    would pool every workspace's SERP data and inherit an unrelated niche's
+    competitors. Crucially this is NOT domain_keywords alone: most researched
+    keywords with SERP data are never written there, so keying only on them hid
+    a workspace's own competitors (see _workspace_keyword_ids).
+
+    When the domain has a CATEGORY and the workspace has keywords tagged with it,
+    results narrow to that category so an Education domain never sees Technology
+    competitors. Category lives only on domain_keywords, so a workspace whose
+    keywords aren't tagged (common) falls back to its full owned set rather than
+    showing nothing. A workspace with no keywords yet gets no suggestions.
+
+    On top of that, when the domain has topic_terms set, keywords whose text is
+    off-topic (a topic_regex miss) are dropped before aggregation. No topic_terms
+    (topic_regex is None) ⇒ no topic filtering, mirroring domain_settings."""
     own = _norm_host(domain.domain)
-    rows_db = db.execute(
+    topic_regex = domain_settings.resolve(
+        domain, getattr(domain, "workspace", None)
+    ).topic_regex
+    stmt = (
         select(
             SerpSnapshotItem.domain,
             SerpSnapshotItem.rank_absolute,
@@ -905,34 +1025,66 @@ def competitor_domains(
             SerpSnapshot.language_code == language,
             SerpSnapshotItem.type == "organic",
         )
-    ).all()
+    )
+    # Isolate to the workspace's own keywords. A domain with no workspace_id (not
+    # persisted, e.g. a unit-test stub) can't be scoped and keeps the locale pool.
+    category_ids: set = set()
+    if domain.workspace_id is not None:
+        owned_ids = _workspace_keyword_ids(db, domain.workspace_id)
+        if not owned_ids:
+            return {"domain": own, "country": country, "count": 0, "rows": []}
+        stmt = stmt.where(SerpSnapshot.keyword_id.in_(owned_ids))
+        if domain.category_id is not None:
+            category_ids = _category_keyword_ids(db, domain.workspace_id, domain.category_id)
+    rows_db = db.execute(stmt).all()
 
-    agg: dict[str, dict] = {}
-    for host, position, keyword_id, keyword in rows_db:
-        h = _norm_host(host)
-        if not h or h == own:
-            continue
-        if any(bad in h for bad in _NON_COMPETITOR_HOSTS):
-            continue
-        a = agg.setdefault(h, {"kids": set(), "positions": [], "keywords": set()})
-        a["kids"].add(keyword_id)
-        a["positions"].append(int(position))
-        a["keywords"].add(keyword)
+    # Drop streaming/movie hosts unless this is an entertainment-niche domain.
+    drop_entertainment = not _is_entertainment_domain(db, domain)
 
-    rows = []
-    for host, a in agg.items():
-        shared = len(a["kids"])
-        if shared < min_shared:
-            continue
-        rows.append({
-            "competitor": host,
-            "keywords_shared": shared,
-            "avg_position": round(sum(a["positions"]) / len(a["positions"]), 1),
-            "best_position": min(a["positions"]),
-            "keywords": sorted(a["keywords"])[:10],
-        })
-    # Most keyword overlap first; break ties by better average rank.
-    rows.sort(key=lambda r: (-r["keywords_shared"], r["avg_position"]))
+    def _aggregate(apply_topic: bool, category_only: bool) -> list[dict]:
+        agg: dict[str, dict] = {}
+        for host, position, keyword_id, keyword in rows_db:
+            h = _norm_host(host)
+            if not h or h == own:
+                continue
+            if any(bad in h for bad in _NON_COMPETITOR_HOSTS):
+                continue
+            if drop_entertainment and any(bad in h for bad in _ENTERTAINMENT_HOSTS):
+                continue
+            if category_only and keyword_id not in category_ids:
+                continue
+            if apply_topic and not _on_topic(keyword, topic_regex):
+                continue
+            a = agg.setdefault(h, {"kids": set(), "positions": [], "keywords": set()})
+            a["kids"].add(keyword_id)
+            a["positions"].append(int(position))
+            a["keywords"].add(keyword)
+
+        out = []
+        for host, a in agg.items():
+            shared = len(a["kids"])
+            if shared < min_shared:
+                continue
+            out.append({
+                "competitor": host,
+                "keywords_shared": shared,
+                "avg_position": round(sum(a["positions"]) / len(a["positions"]), 1),
+                "best_position": min(a["positions"]),
+                "keywords": sorted(a["keywords"])[:10],
+            })
+        # Most keyword overlap first; break ties by better average rank.
+        out.sort(key=lambda r: (-r["keywords_shared"], r["avg_position"]))
+        return out
+
+    # Prefer the category-scoped, topic-filtered set; progressively relax so a
+    # narrow category (no tagged keywords) or narrow topic_terms never wrongly
+    # empties the suggestions.
+    use_category = bool(category_ids)
+    rows = _aggregate(apply_topic=bool(topic_regex), category_only=use_category)
+    if not rows and use_category:
+        rows = _aggregate(apply_topic=bool(topic_regex), category_only=False)
+    if not rows and topic_regex:
+        rows = _aggregate(apply_topic=False, category_only=False)
     rows = rows[:limit]
     return {"domain": own, "country": country, "count": len(rows), "rows": rows}
 

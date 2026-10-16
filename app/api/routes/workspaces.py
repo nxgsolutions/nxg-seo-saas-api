@@ -184,7 +184,8 @@ def create_domain(
 ) -> DomainResponse:
     try:
         domain = domain_service.create_domain(
-            db, ctx.workspace, payload.url, payload.name
+            db, ctx.workspace, payload.url, payload.name,
+            category_id=payload.category_id,
         )
     except InvalidDomainError:
         raise HTTPException(
@@ -220,10 +221,16 @@ def update_domain(
     domain = domain_service.get_domain_in_workspace(db, ctx.workspace, domain_id)
     if domain is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Domain not found")
-    domain = domain_service.update_domain(
-        db, domain, name=payload.name, country=payload.country, language=payload.language,
-        topic_terms=payload.topic_terms, brand_terms=payload.brand_terms, is_local=payload.is_local,
+    update_kwargs = dict(
+        name=payload.name, country=payload.country, language=payload.language,
+        topic_terms=payload.topic_terms, brand_terms=payload.brand_terms,
+        is_local=payload.is_local,
     )
+    # Only touch the category when the client actually sent the field, so an
+    # omitted key leaves it unchanged and an explicit null clears it.
+    if "category_id" in payload.model_fields_set:
+        update_kwargs["category_id"] = payload.category_id
+    domain = domain_service.update_domain(db, domain, **update_kwargs)
     return DomainResponse.model_validate(domain)
 
 

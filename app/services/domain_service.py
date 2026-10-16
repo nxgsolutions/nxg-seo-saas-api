@@ -3,17 +3,23 @@
 import re
 from urllib.parse import urlparse
 
-from sqlalchemy import delete, select
+from sqlalchemy import delete, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.models.domain import Domain
+from app.models.keyword_analysis import DomainKeyword
 from app.models.workspace import Workspace
 
 # A permissive hostname check: labels of letters/digits/hyphens, at least one dot.
 _HOSTNAME_RE = re.compile(
     r"^(?=.{1,253}$)(?!-)[A-Za-z0-9-]{1,63}(?<!-)(\.(?!-)[A-Za-z0-9-]{1,63}(?<!-))+$"
 )
+
+
+# Sentinel so update_domain can tell "leave unchanged" (absent) from "clear"
+# (explicit null) for the category, which has no empty-string form.
+_UNSET = object()
 
 
 class InvalidDomainError(Exception):
@@ -44,9 +50,13 @@ def normalize_domain(raw: str) -> str:
 
 
 def create_domain(
-    db: Session, workspace: Workspace, url: str, name: str | None
+    db: Session, workspace: Workspace, url: str, name: str | None,
+    *, category_id=None,
 ) -> Domain:
-    """Create a domain in the workspace. Raises on invalid/duplicate domain."""
+    """Create a domain in the workspace. Raises on invalid/duplicate domain.
+
+    `category_id` optionally assigns the domain's industry category up front, so
+    competitor suggestions are niche-scoped from the start."""
     domain = normalize_domain(url)
 
     exists = db.execute(
@@ -61,6 +71,7 @@ def create_domain(
         workspace_id=workspace.id,
         name=(name or domain),
         domain=domain,
+        category_id=category_id,
     )
     db.add(domain)
     try:
@@ -76,13 +87,15 @@ def update_domain(
     db: Session, domain: Domain, *, name: str | None = None,
     country: str | None = None, language: str | None = None,
     topic_terms: str | None = None, brand_terms: str | None = None,
-    is_local: bool | None = None,
+    is_local: bool | None = None, category_id=_UNSET,
 ) -> Domain:
-    """Partial update of a domain's market + niche. Only provided fields change.
+    """Partial update of a domain's market + niche + category. Only provided
+    fields change.
 
     country/language accept "" to CLEAR the override (fall back to the workspace
     default); None means "leave unchanged". topic_terms/brand_terms accept "" to
-    clear."""
+    clear. category_id uses the _UNSET sentinel for "leave unchanged"; pass None
+    to clear the category."""
     if name is not None:
         domain.name = name.strip()[:200] or domain.name
     if country is not None:
@@ -95,6 +108,18 @@ def update_domain(
         domain.brand_terms = brand_terms.strip() or None
     if is_local is not None:
         domain.is_local = bool(is_local)
+    category_changed = category_id is not _UNSET and category_id != domain.category_id
+    if category_id is not _UNSET:
+        domain.category_id = category_id
+    if category_changed:
+        # Propagate to the domain's existing keyword links so competitor
+        # suggestions become category-correct on already-researched data,
+        # not only after the next research run.
+        db.execute(
+            update(DomainKeyword)
+            .where(DomainKeyword.domain_id == domain.id)
+            .values(category_id=category_id)
+        )
     db.commit()
     db.refresh(domain)
     return domain

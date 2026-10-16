@@ -15,6 +15,9 @@ class DomainCreate(BaseModel):
 
     url: str = Field(min_length=3, max_length=255)
     name: str | None = Field(default=None, max_length=200)
+    # Optional industry category to assign on creation (scopes competitor
+    # suggestions to that niche). None = uncategorized.
+    category_id: uuid.UUID | None = None
 
     @field_validator("url")
     @classmethod
@@ -45,6 +48,8 @@ class DomainUpdate(BaseModel):
     topic_terms: str | None = Field(default=None, max_length=2000)
     brand_terms: str | None = Field(default=None, max_length=2000)
     is_local: bool | None = None
+    # Industry category. None = leave unchanged; null in JSON clears it.
+    category_id: uuid.UUID | None = None
 
     @field_validator("name")
     @classmethod
@@ -75,4 +80,5 @@ class DomainResponse(BaseModel):
     topic_terms: str | None = None
     brand_terms: str | None = None
     is_local: bool = False
+    category_id: uuid.UUID | None = None
     created_at: datetime

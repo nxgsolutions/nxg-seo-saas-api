@@ -28,6 +28,9 @@ class ContentOptimizeRequest(BaseModel):
 class OptSuggestion(BaseModel):
     area: str
     recommendation: str
+    # Ready-to-use text to apply (e.g. a rewritten meta description); null when
+    # the action isn't a text change.
+    suggestion: str | None = None
     priority: str
 
 

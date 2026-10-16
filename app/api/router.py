@@ -7,6 +7,7 @@ from app.api.routes import (
     auth,
     backlinks,
     billing,
+    categories,
     competitors,
     content_optimization,
     pages,
@@ -40,6 +41,7 @@ api_router.include_router(billing.webhook_router)
 api_router.include_router(content_optimization.router)
 api_router.include_router(pages.router)
 api_router.include_router(my_keywords.router)
+api_router.include_router(categories.router)
 api_router.include_router(competitors.router)
 api_router.include_router(opportunity.router)
 api_router.include_router(integrations.router)

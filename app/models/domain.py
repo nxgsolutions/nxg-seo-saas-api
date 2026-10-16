@@ -51,11 +51,20 @@ class Domain(Base):
     is_local: Mapped[bool] = mapped_column(
         Boolean, nullable=False, server_default=text("false")
     )
+    # Industry category (migration 0044). NULL => no category-scoped filtering
+    # (competitor suggestions fall back to workspace-wide behavior).
+    category_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("categories.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )
 
     workspace = relationship("Workspace")
+    category = relationship("Category")
 
     def __repr__(self) -> str:  # pragma: no cover
         return f"<Domain id={self.id} domain={self.domain!r}>"

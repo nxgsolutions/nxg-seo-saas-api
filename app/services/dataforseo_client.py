@@ -18,6 +18,10 @@ from app.services import data_env
 
 _BASE_URL = "https://api.dataforseo.com"
 _TIMEOUT = httpx.Timeout(30.0, connect=10.0)
+# Live "advanced" SERP (depth 100) for a fresh keyword routinely takes longer
+# than the default read timeout, so those calls get a generous one. The
+# frontend's write timeout (120s) still bounds the whole request.
+_SERP_TIMEOUT = httpx.Timeout(90.0, connect=10.0)
 
 
 class DataForSeoError(RuntimeError):
@@ -46,10 +50,12 @@ def _base_url(env: str | None) -> str:
     return _BASE_URL
 
 
-def _post(path: str, task: dict, env: str | None = None) -> dict:
+def _post(path: str, task: dict, env: str | None = None,
+          timeout: httpx.Timeout | None = None) -> dict:
     """POST a single-task array and return that task's `result` envelope.
 
     `env` ("live" | "sandbox", default per data_env.default_env) picks the host.
+    `timeout` overrides the default read timeout for slow endpoints (live SERP).
 
     DataForSEO wraps everything: {tasks: [{status_code, result: [...]}]}. A task
     status_code of 20000 is success; anything else is surfaced as an error.
@@ -61,7 +67,7 @@ def _post(path: str, task: dict, env: str | None = None) -> dict:
             f"{_base_url(env)}{path}",
             json=[task],
             auth=(settings.DATAFORSEO_LOGIN, settings.DATAFORSEO_PASSWORD),
-            timeout=_TIMEOUT,
+            timeout=timeout or _TIMEOUT,
         )
         response.raise_for_status()
         body = response.json()
@@ -142,7 +148,7 @@ def serp_organic(
         "language_code": language_code,
         "depth": max(1, min(depth, 100)),
     }
-    result = _post("/v3/serp/google/organic/live/advanced", task, env)
+    result = _post("/v3/serp/google/organic/live/advanced", task, env, timeout=_SERP_TIMEOUT)
     items = (result.get("result") or [{}])[0].get("items") or []
 
     out: list[dict] = []
@@ -188,7 +194,7 @@ def serp_organic_snapshot(
         "language_code": language_code,
         "depth": max(1, min(depth, 100)),
     }
-    result = _post("/v3/serp/google/organic/live/advanced", task, env)
+    result = _post("/v3/serp/google/organic/live/advanced", task, env, timeout=_SERP_TIMEOUT)
     res0 = (result.get("result") or [{}])[0]
     raw_items = res0.get("items") or []
 
@@ -262,6 +268,29 @@ def domain_rank_overview(
     result = _post("/v3/dataforseo_labs/google/domain_rank_overview/live", task, env)
     items = (result.get("result") or [{}])[0].get("items") or []
     return (items[0].get("metrics") or None) if items else None
+
+
+def account_balance(env: str | None = None) -> float | None:
+    """Current account balance in USD (appendix/user_data). None if unavailable.
+
+    Used only to measure real spend in tooling/tests — never surfaced in the UI.
+    """
+    if not settings.dataforseo_configured:
+        raise DataForSeoError("DataForSEO credentials are not configured.")
+    try:
+        response = httpx.get(
+            f"{_base_url(env)}/v3/appendix/user_data",
+            auth=(settings.DATAFORSEO_LOGIN, settings.DATAFORSEO_PASSWORD),
+            timeout=_TIMEOUT,
+        )
+        response.raise_for_status()
+        body = response.json()
+    except (httpx.HTTPError, ValueError) as exc:
+        raise DataForSeoError(f"DataForSEO user_data failed: {exc}") from exc
+    task = (body.get("tasks") or [{}])[0]
+    money = ((task.get("result") or [{}])[0] or {}).get("money") or {}
+    bal = money.get("balance")
+    return float(bal) if bal is not None else None
 
 
 def bulk_domain_ranks(targets: list[str], *, env: str | None = None) -> dict[str, int]:

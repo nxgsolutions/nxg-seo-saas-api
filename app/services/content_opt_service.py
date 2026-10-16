@@ -132,9 +132,13 @@ AI_SYSTEM = (
     '"note": "<one short line: what to cover / why>"}],\n'
     '  "intro": "<improved opening paragraph, 2-4 sentences, keyword in the first sentence>",\n'
     '  "recommendations": [{"area": "title|meta|headings|content|keywords|readability|links|media", '
-    '"recommendation": "<one concrete action>", "priority": "high|medium|low"}]\n'
+    '"recommendation": "<the action to take — what to change and why, in one short line>", '
+    '"suggestion": "<when the action is to rewrite or add wording (a title, meta description, heading or '
+    'sentence), the EXACT ready-to-use text to paste in; leave as an empty string when the action is not '
+    'a text change>", "priority": "high|medium|low"}]\n'
     "The outline should keep the page's useful existing sections (is_new=false) and add the missing "
-    "subtopics the top pages cover (is_new=true), 6-12 items. Give 5-8 recommendations, most impactful first."
+    "subtopics the top pages cover (is_new=true), 6-12 items. Give 5-8 recommendations, most impactful first. "
+    'Keep "recommendation" as the instruction (what to do); put any ready-to-use wording in "suggestion".'
 )
 
 
@@ -143,7 +147,6 @@ def _ai_prompt(facts: dict, keyword: str | None, checks: list[dict], bench: dict
     failed = [f"- {c['label']}: {c['value']} → {c['tip']}" for c in checks if c["status"] != "pass"]
     missing = [t["term"] for t in terms if t["status"] != "ok"][:25]
     comp_heads = []
-    print(facts)
     for c in competitors:
         if c.get("facts"):
             heads = [h["text"] for h in c["facts"]["headings"] if h["level"] == 2][:10]
@@ -191,6 +194,7 @@ def _clean_ai(data: dict) -> dict:
             recs.append({
                 "area": str(r.get("area") or "content").lower()[:20],
                 "recommendation": str(r["recommendation"]).strip()[:400],
+                "suggestion": str(r.get("suggestion") or "").strip()[:600] or None,
                 "priority": pr if pr in ("high", "medium", "low") else "medium",
             })
     return {
@@ -260,7 +264,6 @@ def optimize(db: Session, workspace: Workspace, url: str, *, keyword: str | None
                if u.strip() and norm_host(u if re.match(r"^https?://", u.strip(), re.I) else "https://" + u.strip()) in own]
     with ThreadPoolExecutor(max_workers=MAX_COMPETITORS) as pool:
         fetched = list(pool.map(_fetch_competitor, targets)) if targets else []
-        print(fetched)
 
     comp_facts = [c["facts"] for c in fetched if c.get("facts")]
     bench = content_score.benchmark(comp_facts, keyword or "")

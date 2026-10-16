@@ -170,6 +170,25 @@ def refresh_competitor_analytics(
     return CompetitorAnalyticsResponse(**payload)
 
 
+@router.post("/strategy/backlinks/warm",
+             summary="Fetch backlink counts + authority for our domain and its competitors",
+             responses={502: {"description": "DataForSEO error / not configured"}})
+def warm_competitor_backlinks(
+    country: str = _COUNTRY,
+    force: bool = Query(False, description="Re-fetch even if stored backlink data is still fresh"),
+    ctx: DomainContext = Depends(get_domain_context),
+    db: Session = Depends(get_db),
+) -> dict:
+    """Cheap, click-triggered warm-up so the Keyword Breakdown's Authority /
+    Backlinks / Referring-domains columns are populated for our domain and
+    competitors. Reads stay DB-only; reused until stale."""
+    try:
+        return opportunity_service.warm_competitor_backlinks(
+            db, ctx.domain, country=_market(ctx, country), force=force)
+    except DataForSeoError as exc:
+        raise upstream_error(exc) from exc
+
+
 @router.get("/strategy/ranked-keywords/options", response_model=RankedKeywordsOptions,
             summary="Domains with stored ranked keywords + the live allowlist")
 def ranked_keywords_options(country: str = _COUNTRY,

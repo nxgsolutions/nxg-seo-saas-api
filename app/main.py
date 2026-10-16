@@ -9,7 +9,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from app.api.router import api_router
 from app.core.config import settings
 from app.db.session import SessionLocal
-from app.services import billing_service
+from app.services import billing_service, category_service
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -24,8 +24,11 @@ async def lifespan(app: FastAPI):
             inserted = billing_service.seed_default_plans(db)
             if inserted:
                 logger.info("Seeded %d default billing plan(s) on startup.", inserted)
+            seeded_cats = category_service.seed_default_categories(db)
+            if seeded_cats:
+                logger.info("Seeded %d default categor(ies) on startup.", seeded_cats)
     except Exception:  # pragma: no cover - never block startup on the seed
-        logger.exception("Failed to seed default billing plans on startup.")
+        logger.exception("Failed to seed default billing plans/categories on startup.")
     yield
 
 

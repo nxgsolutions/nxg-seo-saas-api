@@ -59,6 +59,10 @@ LOCATION_CODES = {cc: code for cc, (code, _name) in GEO_TARGETS.items()}
 MAX_TARGETS = 20
 _WORKERS = 4
 
+# Backlinks-only warm-up cap. The Backlinks bulk endpoints are cheap (per
+# request, up to 1000 targets each), so own-domain + competitors fits easily.
+WARM_MAX_TARGETS = 100
+
 
 def location_code_for(country: str) -> int:
     code, _ = GEO_TARGETS.get((country or "").lower(), GEO_TARGETS[DEFAULT_COUNTRY])
@@ -145,6 +149,90 @@ def _backfill_backlinks(db: Session, snaps: list[DomainAnalyticsSnapshot], env: 
             s.backlinks = got.get("backlinks")
             s.referring_domains = got.get("referring_domains")
     db.commit()
+
+
+def warm_backlinks(
+    db: Session, targets: list[str], *, location_code: int, language: str,
+    force: bool = False, env: str = data_env.LIVE,
+) -> dict:
+    """Cheap, backlinks-only warm-up for the Keyword Breakdown columns.
+
+    Calls ONLY the Backlinks bulk endpoints (domain rank + backlink / referring
+    counts) — never the per-domain Labs traffic overview — and upserts just the
+    backlink columns onto today's `domain_analytics_snapshots` row. The upsert
+    touches only domain_rank / backlinks / referring_domains, so an existing row
+    filled by the full Labs refresh keeps its traffic metrics.
+
+    Skips targets whose backlink data is still fresh (within the cache TTL)
+    unless `force`. Returns {fetched, cached, failed, error}. Raises only when
+    credentials are missing or every bulk call failed.
+    """
+    if not dataforseo_client.is_configured():
+        raise DataForSeoError("DataForSEO credentials are not configured.")
+
+    targets = list(dict.fromkeys(t for t in targets if t))[:WARM_MAX_TARGETS]
+    if not targets:
+        return {"fetched": 0, "cached": 0, "failed": [], "error": None}
+
+    have = latest(db, targets, location_code=location_code, language=language, env=env)
+    if force:
+        stale = targets
+    else:
+        cutoff = datetime.now(timezone.utc) - timedelta(days=settings.PROVIDER_CACHE_TTL_DAYS)
+        stale = [t for t in targets
+                 if t not in have or have[t].backlinks is None or have[t].fetched_at < cutoff]
+    cached = len(targets) - len(stale)
+    if not stale:
+        return {"fetched": 0, "cached": cached, "failed": [], "error": None}
+
+    try:
+        ranks = dataforseo_client.bulk_domain_ranks(stale, env=env)
+    except DataForSeoError as exc:
+        logger.warning("DataForSEO bulk_ranks failed: %s", exc)
+        ranks = {}
+    try:
+        links = dataforseo_client.bulk_backlinks(stale, env=env)
+    except DataForSeoError as exc:
+        logger.warning("DataForSEO bulk_backlinks failed: %s", exc)
+        links = {}
+    if not ranks and not links:
+        raise DataForSeoError("DataForSEO returned no backlink data.")
+
+    today = date.today()
+    now = datetime.now(timezone.utc)
+    source = "dataforseo_sandbox" if env == data_env.SANDBOX else "dataforseo_backlinks"
+    fetched = 0
+    failed: list[str] = []
+    for t in stale:
+        got = links.get(t) or {}
+        rank = ranks.get(t)
+        if rank is None and not got:
+            failed.append(t)
+            continue
+        values = {
+            "environment": env,
+            "target": t,
+            "location_code": location_code,
+            "language_code": language,
+            "fetched_on": today,
+            "source": source,
+            "domain_rank": rank,
+            "backlinks": got.get("backlinks"),
+            "referring_domains": got.get("referring_domains"),
+            "fetched_at": now,
+        }
+        stmt = insert(DomainAnalyticsSnapshot).values(**values)
+        # On an existing daily row, touch ONLY the backlink columns — never zero
+        # out traffic metrics a full Labs refresh may have stored.
+        stmt = stmt.on_conflict_do_update(
+            constraint="uq_domain_analytics_day",
+            set_={k: stmt.excluded[k]
+                  for k in ("domain_rank", "backlinks", "referring_domains", "fetched_at")},
+        )
+        db.execute(stmt)
+        fetched += 1
+    db.commit()
+    return {"fetched": fetched, "cached": cached, "failed": failed, "error": None}
 
 
 def refresh(

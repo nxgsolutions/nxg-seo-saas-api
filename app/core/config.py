@@ -175,6 +175,9 @@ class Settings(BaseSettings):
     # billed). These two bounds are niche-agnostic numeric thresholds.
     DATAFORSEO_RELEVANT_MAX_POSITION: int = 20
     DATAFORSEO_RELEVANT_MIN_VOLUME: int = 50
+    # Hard cap on keywords per "relevant" fetch (tighter than the shared
+    # multi-page cap, to keep a single Relevant fetch cheap — ≤ ~$0.11).
+    DATAFORSEO_RELEVANT_MAX_KEYWORDS: int = 1000
     # Backlinks API ($0.024/request + $0.000036/row live; sandbox free). Rows kept
     # per list (referring domains / backlinks / anchors / link gap) per fetch, and
     # how many tracked competitors a link-gap fetch compares. A profile fetch is

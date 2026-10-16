@@ -107,6 +107,12 @@ class DomainKeyword(Base):
     )
     country_code: Mapped[str | None] = mapped_column(String(2), nullable=True)
     language_code: Mapped[str | None] = mapped_column(String(10), nullable=True)
+    # Category inherited from the domain that targeted the keyword (migration
+    # 0044), so SERP-derived competitors can be scoped to one industry.
+    category_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("categories.id", ondelete="SET NULL"),
+        nullable=True, index=True,
+    )
     created_at: Mapped[datetime] = _created_at()
 
     keyword: Mapped["Keyword"] = relationship(back_populates="domain_keywords")
