@@ -70,8 +70,14 @@ def parse_psi(data: dict[str, Any]) -> dict[str, Any]:
     return {"performance_score": score, "lab": lab, "field": field}
 
 
-def run_psi(url: str, strategy: str = "mobile") -> dict[str, Any]:
-    """Call PSI for a URL. Raises InvalidUrlError / PsiUnavailableError."""
+def run_psi(
+    url: str, strategy: str = "mobile", timeout_seconds: float = PSI_TIMEOUT_SECONDS
+) -> dict[str, Any]:
+    """Call PSI for a URL. Raises InvalidUrlError / PsiUnavailableError.
+
+    ``timeout_seconds`` is bounded lower for callers (e.g. the page audit) that
+    must stay responsive and fall back when PSI is slow.
+    """
     normalized = normalize_url(url)  # may raise InvalidUrlError
 
     params: dict[str, str] = {
@@ -83,7 +89,7 @@ def run_psi(url: str, strategy: str = "mobile") -> dict[str, Any]:
         params["key"] = settings.PSI_API_KEY
 
     try:
-        response = httpx.get(PSI_ENDPOINT, params=params, timeout=PSI_TIMEOUT_SECONDS)
+        response = httpx.get(PSI_ENDPOINT, params=params, timeout=timeout_seconds)
     except httpx.HTTPError as exc:
         raise PsiUnavailableError(f"Could not reach PageSpeed Insights: {exc}") from exc
 

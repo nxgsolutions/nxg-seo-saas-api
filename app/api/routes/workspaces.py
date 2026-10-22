@@ -203,6 +203,10 @@ def create_domain(
         background_tasks.add_task(gsc_sync.first_sync, ctx.workspace.id, domain.id)
     # Auto-derive the domain's niche from its homepage (best-effort, non-blocking).
     background_tasks.add_task(domain_service.autoderive_topics_task, ctx.workspace.id, domain.id)
+    # Auto-detect the domain's industry category from its site when the caller
+    # didn't set one (best-effort, non-blocking) — no manual category picking.
+    if payload.category_id is None:
+        background_tasks.add_task(domain_service.autodetect_category_task, ctx.workspace.id, domain.id)
     return DomainResponse.model_validate(domain)
 
 

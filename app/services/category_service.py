@@ -74,6 +74,34 @@ def create_category(db: Session, name: str) -> Category:
     return category
 
 
+def get_or_create_category(db: Session, name: str) -> Category:
+    """Return the category matching `name` (by slug), creating it if absent.
+
+    Used by auto-detection: the model's label maps to an existing category when
+    one shares its slug, otherwise a new category is created and returned. Match
+    is on `slug` (so "Real Estate"/"real estate" collapse to the same row).
+    Race-safe: a concurrent insert that trips `uq_categories_slug` is recovered
+    by re-selecting. Raises ValueError on an empty name."""
+    name = (name or "").strip()[:100].strip()
+    if not name:
+        raise ValueError("Category name is required.")
+    slug = slugify(name)
+    existing = db.execute(
+        select(Category).where(Category.slug == slug)
+    ).scalar_one_or_none()
+    if existing is not None:
+        return existing
+    try:
+        return create_category(db, name)
+    except CategoryAlreadyExistsError:
+        found = db.execute(
+            select(Category).where(Category.slug == slug)
+        ).scalar_one_or_none()
+        if found is not None:
+            return found
+        raise
+
+
 def update_category(db: Session, category: Category, *, name: str) -> Category:
     name = name.strip()
     category.name = name

@@ -153,6 +153,53 @@ def test_duplicate_tags_and_invalid_canonical():
     assert {'duplicate_title', 'duplicate_link', 'canonical_invalid'} <= ids
 
 
+def _psi(overall=None, score=None):
+    return {
+        "performance_score": score,
+        "lab": {
+            "lcp": {"display": "2.1 s", "value": 2100},
+            "cls": {"display": "0.05", "value": 0.05},
+            "tbt": {"display": "120 ms", "value": 120},
+        },
+        "field": {"overall": overall} if overall else None,
+    }
+
+
+def test_speed_check_uses_real_field_cwv() -> None:
+    result = analyze_html(GOOD_HTML, "https://example.com/", 200, 9000, len(GOOD_HTML),
+                          psi=_psi(overall="FAST"))
+    speed = next(c for c in result.checks if c.id == "speed")
+    # Real users say the page is fast, so it passes despite the slow fetch time.
+    assert speed.status == "pass"
+    assert "Core Web Vitals" in speed.detail and "LCP 2.1 s" in speed.detail
+    assert result.metrics["speed_source"] == "psi"
+    assert result.metrics["core_web_vitals"]["field"]["overall"] == "FAST"
+
+
+def test_speed_check_poor_field_fails() -> None:
+    result = analyze_html(GOOD_HTML, "https://example.com/", 200, 100, len(GOOD_HTML),
+                          psi=_psi(overall="SLOW"))
+    assert next(c for c in result.checks if c.id == "speed").status == "fail"
+
+
+def test_speed_check_falls_back_to_lab_score() -> None:
+    # No field data → use the lab performance score bucket.
+    result = analyze_html(GOOD_HTML, "https://example.com/", 200, 100, len(GOOD_HTML),
+                          psi=_psi(score=40))
+    speed = next(c for c in result.checks if c.id == "speed")
+    assert speed.status == "fail"
+    assert "40/100" in speed.detail
+
+
+def test_speed_check_falls_back_to_fetch_time_without_psi() -> None:
+    result = analyze_html(GOOD_HTML, "https://example.com/", 200, 5000, len(GOOD_HTML))
+    speed = next(c for c in result.checks if c.id == "speed")
+    assert speed.status == "fail"  # 5000 ms fetch
+    assert "Fetched in" in speed.detail
+    assert result.metrics["speed_source"] == "fetch"
+    assert result.metrics["core_web_vitals"] is None
+
+
 def test_image_detail_limit_is_explicit():
     html = GOOD_HTML + '<img src="x.png" alt="test">' * 205
     result = analyze_html(html, 'https://example.com/', 200, 100, len(html))

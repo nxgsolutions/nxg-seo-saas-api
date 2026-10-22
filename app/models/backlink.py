@@ -19,6 +19,8 @@ from app.db.base import Base
 
 KIND_PROFILE = "profile"
 KIND_GAP = "gap"
+KIND_SITE = "site"   # detail run: all links from one referring host to the target
+KIND_PAGE = "page"   # detail run: all links pointing at one page on the target
 
 
 def _id() -> Mapped[uuid.UUID]:
@@ -35,9 +37,12 @@ class BacklinkRun(Base):
 
     id: Mapped[uuid.UUID] = _id()
     environment: Mapped[str] = mapped_column(String(10), nullable=False, server_default=text("'live'"))
-    kind: Mapped[str] = mapped_column(String(10), nullable=False)  # profile | gap
+    kind: Mapped[str] = mapped_column(String(10), nullable=False)  # profile | gap | site | page
     # profile: the domain profiled. gap: YOUR domain (excluded from the intersection).
     target: Mapped[str] = mapped_column(String(255), nullable=False)
+    # Detail runs only (site | page): the entity this run is scoped to —
+    # "site:<host>" or "page:<url>". NULL for profile/gap runs.
+    scope: Mapped[str | None] = mapped_column(Text)
     competitors: Mapped[list] = mapped_column(JSONB, nullable=False, server_default=text("'[]'::jsonb"))
     rank: Mapped[int | None] = mapped_column(Integer)
     backlinks: Mapped[int | None] = mapped_column(BigInteger)

@@ -458,6 +458,28 @@ def backlinks_list(target: str, *, limit: int, env: str | None = None) -> dict:
     return {"cost": cost, "total_count": r.get("total_count"), "items": items}
 
 
+def backlinks_links_all(target: str, *, limit: int, filters: list | None = None,
+                        env: str | None = None) -> dict:
+    """Endpoint: backlinks/backlinks/live WITHOUT one_per_domain — every matching
+    link (used for per-site / per-page drill-down). `filters` is DataForSEO's
+    filter syntax, e.g. [["domain_from", "=", host]] or [["url_to", "=", url]]."""
+    task = {"target": target, "limit": limit, "order_by": ["rank,desc"],
+            "include_subdomains": True, "rank_scale": "one_hundred"}
+    if filters:
+        task["filters"] = filters
+    r, cost = _bl("/v3/backlinks/backlinks/live", task, env)
+    items = [{
+        "url_from": i.get("url_from"), "domain_from": i.get("domain_from"), "url_to": i.get("url_to"),
+        "anchor": i.get("anchor"), "item_type": i.get("item_type"), "dofollow": i.get("dofollow"),
+        "is_new": bool(i.get("is_new")), "is_lost": bool(i.get("is_lost")),
+        "is_broken": bool(i.get("is_broken")),
+        "domain_from_rank": i.get("domain_from_rank"), "page_from_rank": i.get("page_from_rank"),
+        "page_from_title": i.get("page_from_title"), "spam_score": i.get("backlink_spam_score"),
+        "first_seen": i.get("first_seen"), "last_seen": i.get("last_seen"),
+    } for i in r.get("items") or [] if i.get("url_from")]
+    return {"cost": cost, "total_count": r.get("total_count"), "items": items}
+
+
 def backlinks_anchors(target: str, *, limit: int, env: str | None = None) -> dict:
     """Endpoint: backlinks/anchors/live — most-used anchor texts."""
     r, cost = _bl("/v3/backlinks/anchors/live",

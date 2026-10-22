@@ -16,14 +16,15 @@ you (domain_intersection): 1 request.
 
 from __future__ import annotations
 
+import re
 from datetime import datetime, timezone
 
-from sqlalchemy import select, text
+from sqlalchemy import delete, select, text
 from sqlalchemy.orm import Session
 
 from app.core.config import settings
 from app.models.backlink import (
-    KIND_GAP, KIND_PROFILE, BacklinkAnchor, BacklinkGapDomain, BacklinkLink,
+    KIND_GAP, KIND_PAGE, KIND_PROFILE, KIND_SITE, BacklinkAnchor, BacklinkGapDomain, BacklinkLink,
     BacklinkReferringDomain, BacklinkRun,
 )
 from app.models.domain import Domain
@@ -117,6 +118,17 @@ def latest_run(db: Session, kind: str, target: str, env: str) -> BacklinkRun | N
     ).scalar_one_or_none()
 
 
+def latest_detail_run(db: Session, kind: str, target: str, scope: str, env: str) -> BacklinkRun | None:
+    """Newest site/page detail run for one scoped entity (NULL-scope runs excluded)."""
+    return db.execute(
+        select(BacklinkRun)
+        .where(BacklinkRun.environment == env, BacklinkRun.kind == kind,
+               BacklinkRun.target == norm_host(target), BacklinkRun.scope == scope)
+        .order_by(BacklinkRun.fetched_at.desc())
+        .limit(1)
+    ).scalar_one_or_none()
+
+
 # ── Fetch (the only paths that call DataForSEO) ─────────────────────────────
 
 def fetch_profile(db: Session, target: str, *, env: str, allowed: set[str],
@@ -203,6 +215,47 @@ def fetch_gap(db: Session, domain: Domain, *, env: str, force: bool = False) -> 
         run_id=run.id, domain=(i["domain"] or "")[:255], rank=_int(i["rank"]),
         competitors_linking=i["competitors_linking"], links=i["links"], spam_score=_int(i["spam_score"]),
     ) for i in res["items"] if i.get("domain")])
+    db.commit()
+    return run, True
+
+
+def _store_links(run_id, items) -> list[BacklinkLink]:
+    return [BacklinkLink(
+        run_id=run_id, url_from=i["url_from"], domain_from=(i["domain_from"] or "")[:255] or None,
+        url_to=i["url_to"], anchor=i["anchor"], item_type=(i["item_type"] or "")[:20] or None,
+        dofollow=i["dofollow"], is_new=i["is_new"], is_lost=i["is_lost"], is_broken=i["is_broken"],
+        domain_from_rank=_int(i["domain_from_rank"]), page_from_rank=_int(i["page_from_rank"]),
+        page_from_title=i["page_from_title"], spam_score=_int(i["spam_score"]),
+        first_seen=_dt(i["first_seen"]), last_seen=_dt(i["last_seen"]),
+    ) for i in items]
+
+
+def fetch_links_detail(db: Session, target: str, *, kind: str, value: str, filters: list,
+                       env: str, allowed: set[str], force: bool = False) -> tuple[BacklinkRun, bool]:
+    """Every link for one entity (site host or page url) — the Hybrid "Load all
+    links" fetch. kind is KIND_SITE | KIND_PAGE, value the host/url, filters the
+    DataForSEO filter. Stored as a scoped run and reused until forced. Detail runs
+    are point-in-time (no trend), so a forced refetch replaces the prior run for
+    this scope. Returns (run, fetched_now)."""
+    target = norm_host(target)
+    scope = f"{kind}:{value}"
+    existing = latest_detail_run(db, kind, target, scope, env)
+    if existing and not force:
+        return existing, False
+    _check(target, env, allowed)
+
+    res = dataforseo_client.backlinks_links_all(target, limit=rows_limit(), filters=filters, env=env)
+    stale = db.execute(select(BacklinkRun.id).where(
+        BacklinkRun.environment == env, BacklinkRun.kind == kind,
+        BacklinkRun.target == target, BacklinkRun.scope == scope)).scalars().all()
+    run = BacklinkRun(environment=env, kind=kind, target=target, scope=scope, fetched_at=_now(),
+                      total_count=_int(res.get("total_count")), items_count=len(res["items"]),
+                      requests=1, cost=round(res["cost"], 5))
+    db.add(run)
+    db.flush()
+    db.add_all(_store_links(run.id, res["items"]))
+    if stale:  # CASCADE drops their child links
+        db.execute(delete(BacklinkRun).where(BacklinkRun.id.in_(stale)))
     db.commit()
     return run, True
 
@@ -400,7 +453,232 @@ def details(db: Session, domain: Domain, target: str | None) -> dict:
     return out
 
 
-LISTS = ("domains", "links", "anchors", "pages")
+# ── Analytics: trend, new/lost, anchor classification, quality (compute-only) ─
+
+_TLDS = {"com", "net", "org", "io", "co", "in", "uk", "us", "dev", "app", "ai",
+         "info", "biz", "me", "gov", "edu", "shop", "store", "online", "site"}
+ANCHOR_OVEROPT_SHARE = 0.30   # exact-match share that flags over-optimization
+ANCHOR_MIN = 10               # too few anchors to judge below this
+DOFOLLOW_LOW = 0.10           # mostly-nofollow note
+LINKS_PER_DOMAIN_HIGH = 50    # site-wide / footer links note
+SPAM_DOMAIN = 30              # a linking domain is "spammy" at/above this
+_ANCHOR_CLASSES = ["Branded", "Exact match", "Generic", "URL", "Empty/other"]
+
+
+def brand_tokens(host: str) -> set[str]:
+    """Brand words from the domain name: 'iaspirants.com' -> {'iaspirants'}."""
+    labels = re.split(r"[.\-]", norm_host(host))
+    return {lbl for lbl in labels if len(lbl) >= 3 and lbl not in _TLDS and lbl != "www"}
+
+
+def classify_anchor(anchor: str | None, brands: set[str], keywords: set[str]) -> str:
+    """Heuristic, first match wins: Empty/other, URL, Branded, Exact match, Generic."""
+    a = (anchor or "").strip().lower()
+    if not a:
+        return "Empty/other"
+    if a.startswith(("http://", "https://", "www.")) or (
+            " " not in a and "." in a and a.rsplit(".", 1)[-1] in _TLDS):
+        return "URL"
+    words = set(re.split(r"\W+", a))
+    if (brands & words) or any(b in a for b in brands):
+        return "Branded"
+    if any(k and k in a for k in keywords):
+        return "Exact match"
+    return "Generic"
+
+
+def anchor_mix(anchors: list[dict], brands: set[str], keywords: set[str]) -> dict:
+    counts = {c: 0 for c in _ANCHOR_CLASSES}
+    for a in anchors:
+        counts[classify_anchor(a["anchor"], brands, keywords)] += 1
+    total = sum(counts.values())
+    classes = [{"label": c, "count": counts[c],
+                "share": round(counts[c] / total, 2) if total else 0.0} for c in _ANCHOR_CLASSES]
+    exact_share = (counts["Exact match"] / total) if total else 0.0
+    return {"total": total, "classes": classes,
+            "over_optimized": total >= ANCHOR_MIN and exact_share >= ANCHOR_OVEROPT_SHARE}
+
+
+def _target_keywords(db: Session, domain: Domain) -> set[str]:
+    return {k for k in db.execute(
+        text("SELECT DISTINCT normalized_keyword FROM saved_keywords WHERE domain_id = :d"),
+        {"d": str(domain.id)}).scalars() if k}
+
+
+def analytics(db: Session, domain: Domain, target: str | None) -> dict:
+    """Overview dashboard data: authority/ref-domain trend, new/lost summary,
+    anchor classification mix and link-quality/diversity signals. DB-only."""
+    env = data_env.env_for_domain(db, domain)
+    ours = norm_host(domain.domain)
+    target = norm_host(target or ours)
+    runs = db.execute(
+        select(BacklinkRun).where(BacklinkRun.environment == env, BacklinkRun.kind == KIND_PROFILE,
+                                  BacklinkRun.target == target)
+        .order_by(BacklinkRun.fetched_at.desc()).limit(20)).scalars().all()
+    out: dict = {"target": target, "trend": [], "new_lost": None, "anchors": None, "diversity": None}
+    if not runs:
+        return out
+    out["trend"] = [{"fetched_at": r.fetched_at, "rank": r.rank, "backlinks": r.backlinks,
+                     "referring_domains": r.referring_domains, "spam_score": r.spam_score}
+                    for r in reversed(runs)]  # oldest -> newest for charting
+    payload = profile_payload(db, domain, target)
+    s = payload["summary"] or {}
+    d = details(db, domain, target)
+    st = d["link_status"] or {}
+    ch = d["changes"]
+    out["new_lost"] = {
+        "since": ch["previous_fetched_at"] if ch else None,
+        "backlinks_delta": ch["backlinks"] if ch else None,
+        "referring_domains_delta": ch["referring_domains"] if ch else None,
+        "rank_delta": ch["rank"] if ch else None,
+        "new_links": st.get("new", 0), "lost_links": st.get("lost", 0), "broken_links": st.get("broken", 0),
+        "gained_domains": ch["gained_domains"] if ch else [],
+        "lost_domains": ch["lost_domains"] if ch else [],
+    }
+    keywords = _target_keywords(db, domain) if target == ours else set()
+    out["anchors"] = anchor_mix(payload["anchors"], brand_tokens(target), keywords)
+    rd = s.get("referring_domains") or 0
+    ips = s.get("referring_ips") or 0
+    bl = s.get("backlinks") or 0
+    out["diversity"] = {
+        "referring_domains": s.get("referring_domains"), "referring_ips": s.get("referring_ips"),
+        "dofollow_share": round((s.get("dofollow_referring_domains") or 0) / rd, 2) if rd else None,
+        "spammy_share": s.get("spammy_share"),
+        "links_per_domain": round(bl / rd, 1) if rd else None,
+        "concentrated": bool(rd and bl / rd > LINKS_PER_DOMAIN_HIGH),
+        "shared_ips": bool(rd and ips and ips < 0.5 * rd),
+        "top_tlds": [{"label": f".{x['label']}", "count": x["count"]}
+                     for x in _top(runs[0].summary.get("referring_links_tld"))],
+        "top_countries": _top(runs[0].summary.get("referring_links_countries")),
+    }
+    return out
+
+
+# ── Entity drill-down (DB-only; Hybrid "Load all links" prefers a scoped run) ─
+
+def _link_dict(r: BacklinkLink) -> dict:
+    return {"url_from": r.url_from, "domain_from": r.domain_from, "url_to": r.url_to, "anchor": r.anchor,
+            "item_type": r.item_type, "dofollow": r.dofollow, "is_new": r.is_new, "is_lost": r.is_lost,
+            "is_broken": r.is_broken, "domain_from_rank": r.domain_from_rank,
+            "page_from_title": r.page_from_title, "spam_score": r.spam_score,
+            "first_seen": r.first_seen, "last_seen": r.last_seen}
+
+
+def _detail_meta(kind: str, env: str, target: str, allowed: set[str], run: BacklinkRun | None) -> dict:
+    return {
+        "environment": env, "live_enabled": settings.DATAFORSEO_LIVE_ENABLED,
+        "can_fetch": can_fetch(target, env, allowed), "estimated_cost": estimated_cost(kind, env),
+        "fetched_at": run.fetched_at if run else None,
+        "cost": float(run.cost) if run and run.cost is not None else None,
+    }
+
+
+def _source_links(db: Session, env: str, target: str, kind: str, value: str):
+    """Rows for a drill-down: a scoped detail run if one exists (complete), else
+    the latest profile run's stored subset. Returns (rows, detail_run, complete)."""
+    detail = latest_detail_run(db, kind, target, f"{kind}:{value}", env)
+    if detail:
+        return _rows(db, BacklinkLink, detail.id, (BacklinkLink.domain_from_rank.desc().nulls_last(),)), detail, True
+    prof = latest_run(db, KIND_PROFILE, target, env)
+    if not prof:
+        return [], None, False
+    return _rows(db, BacklinkLink, prof.id, (BacklinkLink.domain_from_rank.desc().nulls_last(),)), None, False
+
+
+def _host_matches(domain_from: str | None, host: str) -> bool:
+    h = norm_host(domain_from or "")
+    return bool(h) and (h == host or h.endswith("." + host))
+
+
+def site_detail(db: Session, domain: Domain, target: str | None, host: str, *,
+                q: str = "", sort: str | None = None, descending: bool = True,
+                page: int = 1, page_size: int = 25) -> dict:
+    from app.services.pagination import paginate
+    env = data_env.env_for_domain(db, domain)
+    ours = norm_host(domain.domain)
+    target = norm_host(target or ours)
+    host = norm_host(host)
+    allowed = allowed_for_domain(db, domain)
+    src, detail, complete = _source_links(db, env, target, KIND_SITE, host)
+    links = [_link_dict(r) for r in src if _host_matches(r.domain_from, host)]
+    out = {
+        "target": target, "host": host, "found": bool(links),
+        "summary": None, "links": [], "pagination": {}, "presence": [], "complete": complete,
+        **_detail_meta(KIND_SITE, env, target, allowed, detail), "fetched_now": False,
+    }
+    if links:
+        authority = max((l["domain_from_rank"] or 0) for l in links) or None
+        firsts = [l["first_seen"] for l in links if l["first_seen"]]
+        lasts = [l["last_seen"] for l in links if l["last_seen"]]
+        out["summary"] = {
+            "host": host, "authority": authority,
+            "spam_score": max((l["spam_score"] or 0) for l in links) or None,
+            "links_to_you": len(links), "dofollow_links": sum(1 for l in links if l["dofollow"]),
+            "first_seen": min(firsts) if firsts else None, "last_seen": max(lasts) if lasts else None,
+            "complete": complete,
+        }
+        runs = db.execute(
+            select(BacklinkRun).where(BacklinkRun.environment == env, BacklinkRun.kind == KIND_PROFILE,
+                                      BacklinkRun.target == target)
+            .order_by(BacklinkRun.fetched_at.desc()).limit(10)).scalars().all()
+        presence = []
+        for run in runs:
+            doms = {norm_host(x.domain) for x in _rows(db, BacklinkReferringDomain, run.id, (BacklinkReferringDomain.domain,))}
+            cnt = sum(1 for x in _rows(db, BacklinkLink, run.id, (BacklinkLink.id,)) if _host_matches(x.domain_from, host))
+            presence.append({"fetched_at": run.fetched_at,
+                             "present": any(d == host or d.endswith("." + host) for d in doms) or cnt > 0,
+                             "links": cnt})
+        out["presence"] = list(reversed(presence))
+    rows = links
+    if q:
+        ql = q.lower()
+        rows = [r for r in rows if ql in (r["url_from"] or "").lower() or ql in (r["anchor"] or "").lower()]
+    keys = {"authority": "domain_from_rank", "first_seen": "first_seen", "last_seen": "last_seen", "spam": "spam_score"}
+    page_rows, info = paginate(rows, page=page, page_size=page_size, sort_key=keys.get(sort or ""), descending=descending)
+    out["links"], out["pagination"] = page_rows, info
+    return out
+
+
+def page_detail(db: Session, domain: Domain, target: str | None, url: str, *,
+                q: str = "", sort: str | None = None, descending: bool = True,
+                page: int = 1, page_size: int = 25) -> dict:
+    from app.services.pagination import paginate
+    env = data_env.env_for_domain(db, domain)
+    ours = norm_host(domain.domain)
+    target = norm_host(target or ours)
+    allowed = allowed_for_domain(db, domain)
+    src, detail, complete = _source_links(db, env, target, KIND_PAGE, url)
+    links = [_link_dict(r) for r in src if r.url_to == url]
+    out = {
+        "target": target, "url": url, "found": bool(links),
+        "summary": None, "links": [], "pagination": {}, "complete": complete,
+        **_detail_meta(KIND_PAGE, env, target, allowed, detail), "fetched_now": False,
+    }
+    if links:
+        broken = any(l["is_broken"] for l in links)
+        firsts = [l["first_seen"] for l in links if l["first_seen"]]
+        lasts = [l["last_seen"] for l in links if l["last_seen"]]
+        out["summary"] = {
+            "url": url, "status": "broken" if broken else "live", "links": len(links),
+            "linking_sites": len({l["domain_from"] for l in links if l["domain_from"]}),
+            "dofollow": sum(1 for l in links if l["dofollow"]),
+            "best_authority": max((l["domain_from_rank"] or 0) for l in links) or None,
+            "first_seen": min(firsts) if firsts else None, "last_seen": max(lasts) if lasts else None,
+            "suggested_fix": "301-redirect to the closest live page" if broken else None,
+            "complete": complete,
+        }
+    rows = links
+    if q:
+        ql = q.lower()
+        rows = [r for r in rows if ql in (r["url_from"] or "").lower() or ql in (r["anchor"] or "").lower()
+                or ql in (r["domain_from"] or "").lower()]
+    keys = {"authority": "domain_from_rank", "first_seen": "first_seen", "last_seen": "last_seen", "spam": "spam_score"}
+    page_rows, info = paginate(rows, page=page, page_size=page_size, sort_key=keys.get(sort or ""), descending=descending)
+    out["links"], out["pagination"] = page_rows, info
+    return out
+
+
+LISTS = ("domains", "links", "anchors", "pages", "reclaim")
 
 
 def list_rows(db: Session, domain: Domain, target: str | None, which: str, *, q: str = "",
@@ -466,6 +744,43 @@ def list_rows(db: Session, domain: Domain, target: str | None, which: str, *, q:
             rows = [r for r in rows if q in r["url"].lower()]
         keys = {"links": "links", "domains": "domains", "authority": "best_authority"}
         key = keys.get(sort or "", "links")
+    elif which == "reclaim":
+        # Broken backlinks grouped by the dead page on this site (url_to): links
+        # earned but now pointing at a page that 404s/5xxs. Restoring or 301ing
+        # those pages recovers the link value. From the saved broken rows only —
+        # the provider total (summary.broken_backlinks) may be larger.
+        grouped: dict[str, dict] = {}
+        for link in payload["backlinks"]:
+            if not link["is_broken"]:
+                continue
+            url = link["url_to"] or "(unknown)"
+            g = grouped.setdefault(url, {"url": url, "links": 0, "domains": set(), "dofollow": 0,
+                                         "best_authority": None, "anchors": set(),
+                                         "first_seen": None, "last_seen": None})
+            g["links"] += 1
+            if link["domain_from"]:
+                g["domains"].add(link["domain_from"])
+            if link["dofollow"]:
+                g["dofollow"] += 1
+            if link["domain_from_rank"] is not None:
+                g["best_authority"] = max(g["best_authority"] or 0, link["domain_from_rank"])
+            if link["anchor"]:
+                g["anchors"].add(link["anchor"])
+            if link["first_seen"] and (g["first_seen"] is None or link["first_seen"] < g["first_seen"]):
+                g["first_seen"] = link["first_seen"]
+            if link["last_seen"] and (g["last_seen"] is None or link["last_seen"] > g["last_seen"]):
+                g["last_seen"] = link["last_seen"]
+        rows = [{
+            **g, "domains": len(g["domains"]), "anchors": sorted(g["anchors"])[:5],
+            # Fix the pages that lose the most link value first: dofollow links
+            # (or any links) weighted by the strongest linking domain.
+            "priority": (g["dofollow"] or g["links"]) * ((g["best_authority"] or 0) + 1),
+        } for g in grouped.values()]
+        if q:
+            rows = [r for r in rows if q in r["url"].lower()]
+        keys = {"priority": "priority", "links": "links", "domains": "domains",
+                "authority": "best_authority", "first_seen": "first_seen", "last_seen": "last_seen"}
+        key = keys.get(sort or "", "priority")
     else:
         raise ValueError("Unknown list.")
     return paginate(rows, page=page, page_size=page_size, sort_key=key, descending=descending)

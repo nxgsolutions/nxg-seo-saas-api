@@ -154,6 +154,31 @@ def autoderive_topics_task(workspace_id, domain_id) -> None:
         db.close()
 
 
+def autodetect_category_task(workspace_id, domain_id) -> None:
+    """Background task (own session): detect and set a domain's industry category
+    from its website, only when it has none yet. Safe to run after create_domain;
+    mirrors autoderive_topics_task. Best-effort — never raises.
+
+    Uses update_domain so the detected category also propagates to the domain's
+    keyword links (there are none yet for a brand-new domain, but this keeps the
+    one assignment path)."""
+    from app.db.session import SessionLocal
+    from app.services import category_detection_service
+
+    db = SessionLocal()
+    try:
+        domain = db.get(Domain, domain_id)
+        if domain is None or domain.category_id is not None:
+            return
+        category = category_detection_service.detect_category(db, domain)
+        if category is not None:
+            update_domain(db, domain, category_id=category.id)
+    except Exception:  # noqa: BLE001 — background best-effort, stay silent
+        db.rollback()
+    finally:
+        db.close()
+
+
 def get_domain_in_workspace(
     db: Session, workspace: Workspace, domain_id: str
 ) -> Domain | None:

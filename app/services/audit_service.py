@@ -30,6 +30,14 @@ MOBILE_UA = (
     "(KHTML, like Gecko) Chrome/124.0 Mobile Safari/537.36 BrightEdgeAuditBot/1.0"
 )
 
+# Page speed: bound the PSI call lower than the standalone tool so an audit
+# stays responsive and falls back to the raw fetch time when PSI is slow.
+PSI_AUDIT_TIMEOUT_SECONDS = 30.0
+
+# Real-user (CrUX) verdict → audit check status.
+_PSI_FIELD_STATUS = {"FAST": "pass", "AVERAGE": "warn", "SLOW": "fail"}
+_PSI_FIELD_PHRASE = {"FAST": "are good", "AVERAGE": "need improvement", "SLOW": "are poor"}
+
 
 class InvalidUrlError(Exception):
     pass
@@ -163,6 +171,36 @@ def _word_count(soup: BeautifulSoup) -> int:
     return len([w for w in re.split(r"\s+", text) if w])
 
 
+def _psi_speed_check(psi: dict[str, Any]) -> Check | None:
+    """Build the scored speed check from real PageSpeed Insights data.
+
+    Prefers field data (Core Web Vitals from real Chrome users via CrUX); falls
+    back to the lab performance score. Returns None when PSI carries no usable
+    signal, so the caller keeps the raw fetch-time heuristic.
+    """
+    lab = psi.get("lab") or {}
+    field = psi.get("field") or None
+    score = psi.get("performance_score")
+
+    def _disp(key: str) -> str | None:
+        return (lab.get(key) or {}).get("display")
+
+    parts = [f"{name} {val}" for name, val in
+             (("LCP", _disp("lcp")), ("CLS", _disp("cls")), ("TBT", _disp("tbt"))) if val]
+    metric_tail = f" {', '.join(parts)}." if parts else ""
+
+    overall = (field or {}).get("overall")
+    if overall in _PSI_FIELD_STATUS:
+        status = _PSI_FIELD_STATUS[overall]
+        detail = f"Real-user Core Web Vitals {_PSI_FIELD_PHRASE[overall]}.{metric_tail}"
+    elif isinstance(score, int):
+        status = "pass" if score >= 90 else "warn" if score >= 50 else "fail"
+        detail = f"PageSpeed performance score {score}/100 (lab-tested).{metric_tail}"
+    else:
+        return None
+    return Check("speed", "Page speed (Core Web Vitals)", status, detail, 2)
+
+
 def analyze_html(
     html: str,
     final_url: str,
@@ -170,8 +208,13 @@ def analyze_html(
     load_time_ms: int,
     page_size_bytes: int,
     device: str = "desktop",
+    psi: dict[str, Any] | None = None,
 ) -> AuditResult:
-    """Pure analysis of a fetched page. Separated so it is unit-testable."""
+    """Pure analysis of a fetched page. Separated so it is unit-testable.
+
+    When ``psi`` (a PageSpeed Insights result) is supplied, the speed check is
+    scored from real Core Web Vitals; otherwise it uses the raw fetch time.
+    """
     soup = BeautifulSoup(html, "html.parser")
     final_host = urlparse(final_url).hostname or ""
     is_https = urlparse(final_url).scheme == "https"
@@ -316,8 +359,12 @@ def analyze_html(
     else:
         checks.append(Check("content", "Content depth", "pass", f"~{word_count} words of content.", 1))
 
-    # Load time (rough — server-side fetch, not a real browser)
-    if load_time_ms <= 1000:
+    # Page speed: prefer real Core Web Vitals (PSI) when available, else fall
+    # back to the raw server-fetch time (rough — not a real browser).
+    psi_speed = _psi_speed_check(psi) if psi else None
+    if psi_speed is not None:
+        checks.append(psi_speed)
+    elif load_time_ms <= 1000:
         checks.append(Check("speed", "Response time", "pass", f"Fetched in {load_time_ms} ms.", 2))
     elif load_time_ms <= 3000:
         checks.append(Check("speed", "Response time", "warn", f"Fetched in {load_time_ms} ms — could be faster.", 2))
@@ -385,6 +432,10 @@ def analyze_html(
         "has_favicon": has_favicon,
         "hreflang_count": hreflang_count,
         "h2_count": h2_count,
+        # Page speed: where the speed check's verdict came from, plus the real
+        # Core Web Vitals when PSI was used (None on the fetch-time fallback).
+        "speed_source": "psi" if psi_speed else "fetch",
+        "core_web_vitals": psi if psi_speed else None,
     }
 
     return AuditResult(
@@ -408,8 +459,31 @@ def _score(checks: list[Check]) -> int:
     return round(100 * got / total)
 
 
-def run_audit(raw_url: str, device: str = "desktop") -> AuditResult:
-    """Full audit: normalize, SSRF-guard, fetch (per device UA), analyze."""
+def _fetch_psi(url: str, device: str) -> dict[str, Any] | None:
+    """Best-effort real Core Web Vitals for the audit's speed score.
+
+    Returns None on any error, timeout or rate limit, so the audit falls back
+    to the raw fetch-time heuristic instead of failing. A local import avoids a
+    circular dependency (psi_service imports from this module).
+    """
+    try:
+        from app.services import psi_service
+
+        return psi_service.run_psi(
+            url,
+            "mobile" if device == "mobile" else "desktop",
+            timeout_seconds=PSI_AUDIT_TIMEOUT_SECONDS,
+        )
+    except Exception:
+        return None
+
+
+def run_audit(raw_url: str, device: str = "desktop", *, with_psi: bool = True) -> AuditResult:
+    """Full audit: normalize, SSRF-guard, fetch (per device UA), analyze.
+
+    When ``with_psi`` is set, real Core Web Vitals (PageSpeed Insights) drive
+    the speed check; it degrades to the raw fetch time if PSI is unavailable.
+    """
     url = normalize_url(raw_url)
     user_agent = MOBILE_UA if device == "mobile" else DESKTOP_UA
     response, final_url, elapsed_ms = _fetch(url, user_agent)
@@ -418,6 +492,8 @@ def run_audit(raw_url: str, device: str = "desktop") -> AuditResult:
     page_size = len(content)
     html = content[:MAX_HTML_BYTES].decode(response.encoding or "utf-8", errors="replace")
 
+    psi = _fetch_psi(final_url, device) if with_psi else None
+
     result = analyze_html(
         html=html,
         final_url=final_url,
@@ -425,6 +501,7 @@ def run_audit(raw_url: str, device: str = "desktop") -> AuditResult:
         load_time_ms=elapsed_ms,
         page_size_bytes=page_size,
         device=device,
+        psi=psi,
     )
     result.html = html
     return result
