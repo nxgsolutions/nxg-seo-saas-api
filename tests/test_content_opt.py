@@ -38,7 +38,9 @@ def test_match_full_partial_none() -> None:
 def test_extract_ignores_page_chrome() -> None:
     f = content_score.extract(_html("T", "UPSC study plan", FILLER, ["Daily schedule"]), "https://site.com/upsc-study-plan")
     assert f["h1"] == ["UPSC study plan"]
-    assert f["internal_links"] == 3  # nav and non-paragraph (menu) links not counted
+    # nav/footer (page chrome) links are not counted; in-content links are —
+    # including the non-paragraph <div> link, so /x /y /z + /menu = 4 internal.
+    assert f["internal_links"] == 4
     assert f["external_links"] == 1
     assert f["images"] == 1 and f["images_missing_alt"] == 0
     assert f["word_count"] > 500

@@ -38,8 +38,9 @@ def test_list_joins_metrics_and_rank_and_pages(client: TestClient, db_session) -
         client.post(base, json={"keyword": k})
     did = base.split("/domains/")[1].split("/")[0]
 
-    # Shared metrics + a tracked rank for `kw`.
-    kid = db_session.execute(text("INSERT INTO keywords (keyword, normalized_keyword) VALUES (:k, :k) RETURNING id"),
+    # Shared metrics + a tracked rank for `kw`. Saving already created the canonical
+    # keywords row (saved_keywords_service._canonical_keyword_id), so reuse its id.
+    kid = db_session.execute(text("SELECT id FROM keywords WHERE normalized_keyword = :k"),
                              {"k": kw}).scalar_one()
     db_session.execute(text("""INSERT INTO keyword_metrics (keyword_id, country_code, language_code, search_volume, cpc,
                               difficulty, metric_date) VALUES (:id, 'in', 'en', 1900, 12.5, 41, :d)"""),

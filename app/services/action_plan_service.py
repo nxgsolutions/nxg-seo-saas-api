@@ -301,8 +301,24 @@ def build(db: Session, domain: Domain, *,
     }
 
 
+def _ensure_rank_tracked(db: Session, domain: Domain, keyword: str) -> None:
+    """Also add the keyword to the domain's real Rank Tracking list so the user can
+    see it (with position history) on the Rank Tracking page. Idempotent — an
+    already-tracked keyword is left as-is."""
+    from app.services import rank_service
+
+    try:
+        rank_service.add_keyword(db, domain, keyword)
+    except rank_service.KeywordExistsError:
+        pass
+
+
 def track_keyword(db: Session, domain: Domain, keyword: str, *, country: str | None = None) -> dict:
-    """Add a keyword to the domain's tracked (opportunity) list — idempotent."""
+    """Add a keyword to the domain's tracked list — idempotent.
+
+    Writes to `opportunity_keywords` (feeds the Action Plan's own math) AND to the
+    real Rank Tracking list, so tracked keywords actually surface for the user.
+    """
     from app.services import keyword_analysis_service as kas, keyword_scoring
 
     if country is None:
@@ -314,6 +330,7 @@ def track_keyword(db: Session, domain: Domain, keyword: str, *, country: str | N
         "SELECT id FROM opportunity_keywords WHERE domain_id = :d AND lower(keyword) = lower(:k)"),
         {"d": str(domain.id), "k": kw_text}).first()
     if existing:
+        _ensure_rank_tracked(db, domain, kw_text)
         return {"keyword": kw_text, "tracked": True, "created": False}
 
     kw = kas._upsert_keyword(db, kw_text)
@@ -330,4 +347,5 @@ def track_keyword(db: Session, domain: Domain, keyword: str, *, country: str | N
         country_code=country,
     ))
     db.commit()
+    _ensure_rank_tracked(db, domain, kw_text)
     return {"keyword": kw_text, "tracked": True, "created": True}

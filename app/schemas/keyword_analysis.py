@@ -66,6 +66,9 @@ class ResearchSummary(BaseModel):
 class ResearchDetail(ResearchSummary):
     # The seed keyword's own metric drives the summary header.
     seed_metric: KeywordMetricOut | None = None
+    # Whether the search-volume / CPC data source is set up for this server. Lets
+    # the UI tell "not set up yet" apart from "set up but couldn't load this time".
+    ads_available: bool = False
     questions: list[str] = []
     # Per-category counts for the Ubersuggest-style idea tabs.
     categories: list[CategoryCount] = []

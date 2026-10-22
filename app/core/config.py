@@ -67,7 +67,9 @@ class Settings(BaseSettings):
     # set GOOGLE_ADS_LOGIN_CUSTOMER_ID to the MCC id.
     GOOGLE_ADS_CUSTOMER_ID: str = ""
     GOOGLE_ADS_LOGIN_CUSTOMER_ID: str = ""
-    GOOGLE_ADS_API_VERSION: str = "v22"
+    # Google Ads API version. Bump when Google deprecates one (a deprecated
+    # version returns 400 UNSUPPORTED_VERSION and all volume/CPC goes blank).
+    GOOGLE_ADS_API_VERSION: str = "v26"
     # Optional dedicated OAuth client for Ads. Set these to run Ads on a different
     # Google account/Cloud project without touching the GSC client above; when
     # blank they fall back to GOOGLE_OAUTH_CLIENT_ID/SECRET.
@@ -188,7 +190,9 @@ class Settings(BaseSettings):
     # User-clicked SERP fetches are not affected.
     SERP_SYNC_ENABLED: bool = False
     DATAFORSEO_BACKLINKS_ROWS: int = 100
-    DATAFORSEO_BACKLINKS_MAX_COMPETITORS: int = 5
+    # Competitors compared in one Link Gap (a single domain_intersection request,
+    # so more competitors ≈ no extra request cost; provider accepts up to ~20).
+    DATAFORSEO_BACKLINKS_MAX_COMPETITORS: int = 10
 
     @property
     def live_ranked_targets(self) -> set[str]:

@@ -145,12 +145,19 @@ def extract(html: str, url: str) -> dict[str, Any]:
     first = next((p for p in paragraphs if len(p.split()) >= 12), " ".join(body.split()[:100]))
 
     internal = external = 0
-    # In-text links only (inside paragraphs): menus and sidebars that aren't
-    # marked up as <nav>/<aside> would otherwise add hundreds of site links.
-    for a in (x for p in root.find_all("p") for x in p.find_all("a", href=True)):
+    # Links in the main content. Page chrome (nav/header/footer/aside) is already
+    # removed above, so these are content links — including ones in lists, cards
+    # and headings, not just <p> (many pages link from those, not paragraphs).
+    # Deduped by href so a card linked by both its image and its title, or a
+    # repeated link, counts once.
+    seen_links: set[str] = set()
+    for a in root.find_all("a", href=True):
         href = a["href"].strip()
-        if href.startswith(("#", "mailto:", "tel:", "javascript:")):
+        if not href or href.startswith(("#", "mailto:", "tel:", "javascript:")):
             continue
+        if href in seen_links:
+            continue
+        seen_links.add(href)
         h = _host(href) if href.startswith(("http://", "https://", "//")) else host
         if h == host or h.endswith("." + host):
             internal += 1

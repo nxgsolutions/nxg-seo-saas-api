@@ -244,7 +244,10 @@ def _planner_keywords(
         rows = keyword_planner_service.historical_metrics(
             kws, country=country, language=language
         )
-    except keyword_planner_service.PlannerError:
+    except keyword_planner_service.PlannerError as exc:
+        # Surface the real cause (e.g. deprecated API version, access level) in the
+        # logs — the UI only gets a neutral "couldn't load" state, never this text.
+        logger.warning("Keyword Planner metrics unavailable: %s", exc)
         return {}
     except Exception:  # noqa: BLE001 — market data is best-effort; never fail the run
         logger.exception("Keyword Planner metrics failed; continuing without them")

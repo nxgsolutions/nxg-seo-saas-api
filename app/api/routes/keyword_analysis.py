@@ -8,6 +8,7 @@ from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.orm import Session
 
 from app.api.deps import DomainContext, get_domain_context
+from app.core.config import settings
 from app.db.session import get_db
 from app.models.keyword_analysis import Keyword, KeywordMetric, KeywordResearch
 from app.schemas.keyword_analysis import (
@@ -102,6 +103,7 @@ def _detail(db: Session, research: KeywordResearch, *, include_results: bool = T
     return ResearchDetail(
         **summary,
         seed_metric=seed_metric,
+        ads_available=settings.google_ads_configured,
         questions=keyword_analysis_service.research_questions(db, research),
         categories=categories,
         results=results if include_results else [],
