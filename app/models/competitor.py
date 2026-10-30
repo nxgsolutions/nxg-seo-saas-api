@@ -59,6 +59,9 @@ class TrackedCompetitor(Base):
     # populated for source='ai'.
     reason: Mapped[str | None] = mapped_column(String(600), nullable=True)
     confidence: Mapped[str | None] = mapped_column(String(20), nullable=True)
+    # LLM relevance score 0-100 (how closely the competitor's PRIMARY business
+    # overlaps the target). Null for manual adds / older rows.
+    match_score: Mapped[int | None] = mapped_column(Integer, nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )
@@ -106,4 +109,37 @@ class CompetitorRankSnapshot(Base):
     )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+
+class CompetitorDiscoveryJob(Base):
+    """Async competitor-discovery run (migration 0048). Started by the discover
+    route; a background worker runs the 3-agent pipeline and updates `step` /
+    `step_label` as it goes. The UI polls this row for live progress, then
+    refetches the competitor list when status='done'."""
+
+    __tablename__ = "competitor_discovery_jobs"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, server_default=text("gen_random_uuid()")
+    )
+    domain_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("domains.id", ondelete="CASCADE"),
+        nullable=False, index=True,
+    )
+    status: Mapped[str] = mapped_column(
+        String(16), nullable=False, server_default=text("'running'")
+    )  # 'running' | 'done' | 'error'
+    step: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("0"))
+    step_label: Mapped[str | None] = mapped_column(String(120), nullable=True)
+    total_steps: Mapped[int] = mapped_column(
+        Integer, nullable=False, server_default=text("5")
+    )
+    count: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    error: Mapped[str | None] = mapped_column(String(300), nullable=True)
+    started_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    finished_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
     )

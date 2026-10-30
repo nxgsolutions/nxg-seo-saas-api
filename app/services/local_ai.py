@@ -50,6 +50,13 @@ def chat_json(system: str, user: str, timeout: float = 240.0, *,
     }
     if think is not None:
         body["think"] = think
+    from app.services import ai_debug
+
+    ai_debug.log_call(
+        "local_ai.chat_json", system=system, user=user,
+        params={"model": settings.OLLAMA_MODEL, "think": think,
+                "options": body["options"]},
+    )
     try:
         with httpx.Client(timeout=timeout) as client:
             resp = client.post(f"{settings.OLLAMA_BASE_URL}/api/chat", json=body)
@@ -59,6 +66,7 @@ def chat_json(system: str, user: str, timeout: float = 240.0, *,
         raise LocalAiError(f"Ollama error ({resp.status_code}): {resp.text[:200]}")
 
     content = (resp.json().get("message") or {}).get("content", "").strip()
+    ai_debug.log_call("local_ai.chat_json", output=content)
     if content.startswith("```"):
         content = content.strip("`")
         content = content.removeprefix("json").strip()

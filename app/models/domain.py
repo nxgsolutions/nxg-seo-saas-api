@@ -13,7 +13,7 @@ from sqlalchemy import (
     func,
     text,
 )
-from sqlalchemy.dialects.postgresql import UUID
+from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.db.base import Base
@@ -58,6 +58,13 @@ class Domain(Base):
         ForeignKey("categories.id", ondelete="SET NULL"),
         nullable=True,
         index=True,
+    )
+    # Cached LLM business profile from competitor discovery (migration 0046):
+    # {business_description, industry, services, target_audience, market}.
+    # NULL = not extracted yet; reused on later discoveries unless refresh=True.
+    business_profile: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
+    business_profile_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
     )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()

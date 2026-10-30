@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import date
+from datetime import date, datetime
 
 from pydantic import BaseModel
 
@@ -27,6 +27,7 @@ class CuratedCompetitor(BaseModel):
     source: str                      # 'auto' | 'manual' | 'ai'
     reason: str | None = None        # LLM rationale (source='ai')
     confidence: str | None = None    # 'Very High'/'High'/'Medium'/'Low'
+    match_score: int | None = None   # 0-100 relevance (source='ai')
     # Latest known SERP standing (null if this competitor has no snapshot yet).
     avg_position: float | None = None
     best_position: int | None = None
@@ -52,6 +53,56 @@ class CompetitorDiscoverRequest(BaseModel):
     # Extra services/features to add to the scraped ones (features not yet on the
     # site), to steer the competitor match. E.g. ["AI-based Mains answer evaluation"].
     extra_services: list[str] | None = Field(None, max_length=20)
+    # Re-scrape and re-extract the business profile instead of reusing the cached
+    # one. Default False = reuse the stored profile (fast, no re-extraction).
+    refresh: bool = False
+
+
+class DiscoveryJobOut(BaseModel):
+    """Live status of an async discovery run, polled by the UI for step progress."""
+    job_id: str
+    status: str                      # 'running' | 'done' | 'error'
+    step: int                        # 0..total_steps
+    step_label: str | None = None
+    total_steps: int
+    count: int | None = None         # competitors found (when done)
+    error: str | None = None
+
+
+class BusinessProfile(BaseModel):
+    """The business details the LLM extracts from the site in the first pass of
+    discovery (shown above the competitor list)."""
+    business_description: str | None = None
+    # Short commerce-model label only, e.g. "D2C e-commerce / online retail".
+    industry: str | None = None
+    # Short product niche / market sector, e.g. "Handcrafted brass décor & pooja".
+    sector: str | None = None
+    # "products" | "services" | "both" — what the site primarily offers.
+    business_type: str | None = None
+    # Core products that define the business (match on these first).
+    primary_products: list[str] = []
+    # Supporting / peripheral products (minor weight for matching).
+    secondary_products: list[str] = []
+    # Combined primary+secondary, de-duped (back-compat for matching/storage).
+    products: list[str] = []
+    # Services / offerings / features (empty for a pure product catalog).
+    services: list[str] = []
+    # Short distinctive angle, e.g. "Handcrafted religious & Vastu brass".
+    specialties: str | None = None
+    # Price tier, e.g. "premium, ~₹1,500-15,000". Separates premium makers from
+    # cheap mass sellers during matching.
+    price_positioning: str | None = None
+    target_audience: str | None = None
+    market: str | None = None
+
+
+class BusinessProfileResponse(BaseModel):
+    domain: str
+    # The analyzed site the profile was extracted from (defaults to the domain).
+    target: str | None = None
+    # null when the profile hasn't been extracted yet (run discovery once).
+    profile: BusinessProfile | None = None
+    extracted_at: datetime | None = None
 
 
 class CompetitorDiscoverResponse(BaseModel):
@@ -59,6 +110,8 @@ class CompetitorDiscoverResponse(BaseModel):
     target: str
     market: str
     count: int
+    # The business profile extracted from the analyzed site (first pass).
+    profile: BusinessProfile | None = None
     competitors: list[CuratedCompetitor]
 
 

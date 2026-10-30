@@ -10,15 +10,24 @@ user refreshes over time (no demo / simulated data).
 
 from __future__ import annotations
 
-from datetime import date
+from datetime import date, datetime, timezone
 
 from sqlalchemy import select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.orm import Session
 
-from app.models.competitor import CompetitorRankSnapshot, TrackedCompetitor
+from app.db.session import SessionLocal
+from app.models.competitor import (
+    CompetitorDiscoveryJob,
+    CompetitorRankSnapshot,
+    TrackedCompetitor,
+)
 from app.models.domain import Domain
-from app.services import keyword_analysis_service
+from app.services import (
+    domain_analytics_service,
+    domain_settings,
+    keyword_analysis_service,
+)
 
 # How many top competitors to persist per refresh / return in the trend.
 TRACK_LIMIT = 10
@@ -84,6 +93,7 @@ def list_competitors(db: Session, domain: Domain) -> dict:
             "source": tc.source,
             "reason": tc.reason,
             "confidence": tc.confidence,
+            "match_score": tc.match_score,
             "avg_position": round(snap.avg_position, 1) if snap else None,
             "best_position": snap.best_position if snap else None,
             "keywords_shared": snap.keywords_shared if snap else None,
@@ -125,6 +135,7 @@ def add_competitor(
         "source": existing.source,
         "reason": existing.reason,
         "confidence": existing.confidence,
+        "match_score": existing.match_score,
         "avg_position": round(snap.avg_position, 1) if snap else None,
         "best_position": snap.best_position if snap else None,
         "keywords_shared": snap.keywords_shared if snap else None,
@@ -329,27 +340,76 @@ def refresh(
 
 # ── LLM competitor discovery (by domain) ────────────────────────────────────
 
-_MARKET_TO_CC = {
-    "india": "in", "united states": "us", "usa": "us", "united kingdom": "gb",
-    "uk": "gb", "canada": "ca", "australia": "au",
-}
-
 
 def discover_and_store(
     db: Session, domain: Domain, *, target_domain: str | None = None,
     limit: int = 10, extra_services: list[str] | None = None,
+    refresh: bool = False, progress=None,
 ) -> dict:
     """Run the LLM competitor finder for `target_domain` (defaults to the domain
     itself), replace the auto/AI-sourced curated entries with the results (keeping
     the user's manual ones), then snapshot ranks for any with SERP data.
-    `extra_services` steers the match toward features not yet on the site."""
+    `extra_services` steers the match toward features not yet on the site.
+
+    The competitor market follows the domain's CONFIGURED country (domain →
+    workspace → global default), not the LLM's guess, so a domain set to India
+    gets Indian competitors. The business profile extracted from the domain's own
+    site is cached on the domain and reused on later runs; `refresh=True` forces a
+    fresh extraction."""
     from app.services import competitor_discovery_service as disc
 
     target = (target_domain or domain.domain).strip()
-    result = disc.discover(target, limit=limit, extra_services=extra_services)
+
+    # Market = the domain's configured country, not whatever the LLM infers.
+    cfg = domain_settings.resolve(domain, getattr(domain, "workspace", None))
+    country = cfg.country
+    market = domain_analytics_service.location_name_for(country)
+
+    # Reuse the cached business profile when discovering for the domain itself
+    # (not an arbitrary target) and the caller didn't ask for a refresh.
+    own_host = keyword_analysis_service._norm_host(domain.domain)
+    target_host = keyword_analysis_service._norm_host(target)
+    is_own = bool(own_host) and target_host == own_host
+    cached = domain.business_profile if (is_own and not refresh) else None
+
+    # Enrichment: real competitors from SERP data (domains that actually rank for
+    # this site's keywords). Blended into the candidate pool so the list reliably
+    # fills to `limit`. Empty for a brand-new domain with no SERP data yet, so the
+    # flow falls back to pure profiling automatically. Best-effort.
+    extra_candidates: list[str] = []
+    if is_own:
+        try:
+            sugg = get_suggestions(db, domain, country=country, language=cfg.language, limit=20)
+            extra_candidates = [r["competitor"] for r in sugg["rows"]]
+        except Exception:  # noqa: BLE001 - SERP enrichment is a bonus, not required
+            extra_candidates = []
+
+    # The workspace's own OTHER tracked domains — excluded from the results so a
+    # newly-added sibling property never shows up as a "competitor" of this one.
+    sibling_domains = [
+        d for d in db.execute(
+            select(Domain.domain).where(
+                Domain.workspace_id == domain.workspace_id,
+                Domain.id != domain.id,
+            )
+        ).scalars().all()
+        if d
+    ]
+
+    # Three agents: 1) profile this business, 2) propose candidates (+ SERP),
+    # 3) profile each candidate's real site and keep the best `limit` matches.
+    result = disc.discover(
+        target, limit=limit, extra_services=extra_services,
+        business=cached, market=market, extra_candidates=extra_candidates,
+        exclude_domains=sibling_domains, progress=progress,
+    )
     comps = result["competitors"]
-    market = result.get("market") or "India"
-    country = _MARKET_TO_CC.get(market.strip().lower(), "in")
+
+    # Persist the (possibly freshly extracted) profile for reuse next time.
+    if is_own and result.get("business"):
+        domain.business_profile = result["business"]
+        domain.business_profile_at = datetime.now(timezone.utc)
+        db.add(domain)
 
     # Replace previous auto/ai entries; keep manual ones the user curated.
     for tc in db.execute(
@@ -374,6 +434,7 @@ def discover_and_store(
             source="ai",
             reason=(c.get("reason") or None),
             confidence=(c.get("confidence_level") or None),
+            match_score=c.get("match_score"),
         ))
         kept.add(host)
         stored += 1
@@ -386,5 +447,140 @@ def discover_and_store(
         "target": target,
         "market": market,
         "count": stored,
+        "profile": result.get("business") or None,
         "competitors": list_competitors(db, domain)["rows"],
+    }
+
+
+# ── Async discovery job (background worker + live step progress) ─────────────
+
+def create_discovery_job(db: Session, domain: Domain) -> CompetitorDiscoveryJob:
+    """Create a 'running' job row the UI can poll for live progress."""
+    from app.services.competitor_discovery_service import DISCOVERY_STEPS
+
+    job = CompetitorDiscoveryJob(
+        domain_id=domain.id, status="running", step=0,
+        step_label="Starting…", total_steps=len(DISCOVERY_STEPS),
+    )
+    db.add(job)
+    db.commit()
+    db.refresh(job)
+    return job
+
+
+def get_discovery_job(db: Session, job_id) -> CompetitorDiscoveryJob | None:
+    return db.get(CompetitorDiscoveryJob, job_id)
+
+
+def active_discovery_job(db: Session, domain: Domain) -> CompetitorDiscoveryJob | None:
+    """Most recent still-running job for this domain (to avoid duplicate runs)."""
+    return db.execute(
+        select(CompetitorDiscoveryJob)
+        .where(CompetitorDiscoveryJob.domain_id == domain.id,
+               CompetitorDiscoveryJob.status == "running")
+        .order_by(CompetitorDiscoveryJob.started_at.desc())
+    ).scalars().first()
+
+
+def run_discovery_job(
+    workspace_id, domain_id, job_id, *, target_domain: str | None = None,
+    limit: int = 10, extra_services: list[str] | None = None, refresh: bool = False,
+    session_factory=None,
+) -> None:
+    """Background worker: runs the 3-agent discovery, updating the job row's step
+    as it goes, and stores the result. Own DB session; never raises (the user's
+    request already returned)."""
+    db = (session_factory or SessionLocal)()
+    job = None
+    try:
+        job = db.get(CompetitorDiscoveryJob, job_id)
+        domain = db.get(Domain, domain_id)
+        if job is None or domain is None or domain.workspace_id != workspace_id:
+            return
+
+        def _cb(step: int, label: str) -> None:
+            job.step = step
+            job.step_label = label
+            db.add(job)
+            db.commit()
+
+        result = discover_and_store(
+            db, domain, target_domain=target_domain, limit=limit,
+            extra_services=extra_services, refresh=refresh, progress=_cb,
+        )
+        job.status = "done"
+        job.step = job.total_steps
+        job.step_label = "Done"
+        job.count = int(result.get("count") or 0)
+        job.finished_at = datetime.now(timezone.utc)
+        db.add(job)
+        db.commit()
+    except Exception as exc:  # noqa: BLE001 - background worker, log & record
+        from app.services.competitor_discovery_service import DiscoveryError
+        import logging
+        logging.getLogger("app.api").exception("discovery job %s failed", job_id)
+        msg = ("We couldn't find competitors right now. Please try again."
+               if isinstance(exc, DiscoveryError)
+               else "Something went wrong while finding competitors.")
+        try:
+            if job is not None:
+                db.rollback()
+                job.status = "error"
+                job.error = msg
+                job.finished_at = datetime.now(timezone.utc)
+                db.add(job)
+                db.commit()
+        except Exception:  # noqa: BLE001
+            pass
+    finally:
+        db.close()
+
+
+def get_business_profile(db: Session, domain: Domain) -> dict:
+    """Return the business profile cached on the domain (the first-pass output of
+    discovery), so the UI can show it above the competitor list without re-running
+    the LLM. `profile` is null until the first discovery extracts it."""
+    return {
+        "domain": domain.domain,
+        "target": domain.domain,
+        "profile": domain.business_profile or None,
+        "extracted_at": domain.business_profile_at,
+    }
+
+
+def refresh_business_profile(
+    db: Session, domain: Domain, *, target_domain: str | None = None,
+) -> dict:
+    """Re-run ONLY the first pass of discovery: re-scrape the site and re-extract
+    the business profile, then persist it on the domain. The competitor list is
+    left untouched (this is the cheap "just fix my profile" path).
+
+    The stored `market` is pinned to the domain's CONFIGURED country so the
+    profile headline market matches the rest of the app, regardless of what the
+    LLM infers from the page text.
+    """
+    from app.services import competitor_discovery_service as disc
+
+    target = (target_domain or domain.domain).strip()
+    profile = disc.extract_business_profile(target)
+
+    # Pin the market to the domain's configured country (same rule discovery uses).
+    cfg = domain_settings.resolve(domain, getattr(domain, "workspace", None))
+    profile["market"] = domain_analytics_service.location_name_for(cfg.country)
+
+    # Only cache it when profiling the domain itself (not an arbitrary target).
+    own_host = keyword_analysis_service._norm_host(domain.domain)
+    target_host = keyword_analysis_service._norm_host(target)
+    if own_host and target_host == own_host:
+        domain.business_profile = profile
+        domain.business_profile_at = datetime.now(timezone.utc)
+        db.add(domain)
+        db.commit()
+        db.refresh(domain)
+
+    return {
+        "domain": domain.domain,
+        "target": target,
+        "profile": profile,
+        "extracted_at": domain.business_profile_at,
     }

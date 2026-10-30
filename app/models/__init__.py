@@ -21,6 +21,7 @@ from app.models.opportunity import (
 )
 from app.models.content_optimization import ContentOptimization
 from app.models.domain_analytics import DomainAnalyticsSnapshot
+from app.models.domain_score import DomainScore, DomainScoreJob
 from app.models.ranked_keyword import DomainRankedKeyword, DomainRankedKeywordRun
 from app.models.gsc_connection import GscConnection
 from app.models.job_run import JobRun

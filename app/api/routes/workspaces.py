@@ -1,5 +1,7 @@
 """Workspace routes (including workspace-scoped domains)."""
 
+import uuid
+
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Response, status
 from sqlalchemy.orm import Session
 
@@ -16,6 +18,11 @@ from app.schemas.page_audit import (
     PageAuditRunRequest,
     PageAuditSummary,
 )
+from app.schemas.page_score import (
+    PageScoreRequest,
+    PageScoreResponse,
+    PerformanceContext,
+)
 from app.schemas.domain import DomainCreate, DomainResponse, DomainUpdate
 from app.schemas.workspace import (
     WorkspaceCreate,
@@ -26,11 +33,14 @@ from app.schemas.workspace import (
     WorkspaceUpdate,
 )
 from app.jobs import gsc_sync
+from app.models.domain import Domain
+from app.models.site_page import SitePage
 from app.services import (
     audit_service,
     gsc_service,
     page_audit_service,
     page_history_service,
+    page_score_service,
     domain_service,
     workspace_service,
 )
@@ -361,6 +371,73 @@ def _audit_out(db: Session, ctx: WorkspaceContext, record) -> PageAuditDetail:
     out = PageAuditDetail.model_validate(record)
     out.page_id, out.changes = page_history_service.for_run(db, ctx.workspace, record.id)
     return out
+
+
+@router.post(
+    "/{workspace_id}/page-scores",
+    response_model=PageScoreResponse,
+    status_code=status.HTTP_201_CREATED,
+    summary="Run an overall SEO score and save it to the page's history",
+    responses={
+        400: {"description": "The page could not be fetched"},
+        404: {"description": "Workspace not found"},
+        422: {"description": "Invalid or disallowed URL"},
+    },
+)
+def run_page_score(
+    payload: PageScoreRequest,
+    ctx: WorkspaceContext = Depends(get_workspace_context),
+    db: Session = Depends(get_db),
+) -> PageScoreResponse:
+    """Score the URL server-side, snapshot it for history, and attach real
+    Search Console numbers as context (never blended into the score)."""
+    try:
+        result = page_score_service.run_page_score(
+            payload.url, keyword=payload.keyword, device=payload.device
+        )
+    except (InvalidUrlError, BlockedUrlError) as exc:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(exc)
+        )
+    except FetchError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)
+        )
+
+    # Record a page-history snapshot (source "score"). History must never fail
+    # the score, so a failure just drops the page link.
+    run_id = uuid.uuid4()
+    checks = [{"id": c["id"], "label": c["label"], "status": c["status"]} for c in result.audit_checks]
+    page_id: uuid.UUID | None = None
+    changes: list[dict] = []
+    captured_at = None
+    try:
+        snap = page_history_service.record(
+            db, ctx.workspace, result.final_url, html=result.html, source="score", source_id=run_id,
+            device=payload.device, audit_score=result.audit_score, content_score_value=result.content_score,
+            overall_score=result.overall, keyword=result.keyword or None,
+            category_scores={c.id: c.score for c in result.categories}, checks=checks,
+            tech=page_history_service.audit_tech(result.status_code, result.load_time_ms,
+                                                 result.page_size_bytes, result.metrics, checks),
+        )
+        page_id, changes, captured_at = snap.page_id, snap.changes or [], snap.captured_at
+    except Exception:  # noqa: BLE001
+        db.rollback()
+
+    # Real-world performance (GSC) for the page — context only.
+    perf_ctx: PerformanceContext | None = None
+    page = db.get(SitePage, page_id) if page_id else None
+    domain = db.get(Domain, page.domain_id) if page and page.domain_id else None
+    perf = page_score_service.gsc_context(db, ctx.workspace, domain, result.final_url) if domain else None
+    if perf:
+        perf_ctx = PerformanceContext(
+            clicks=perf["clicks"], impressions=perf["impressions"], ctr=perf["ctr"],
+            position=perf["position"], days=perf["days"], queries=perf.get("queries", []),
+        )
+
+    return PageScoreResponse.from_result(
+        result, performance_context=perf_ctx, page_id=page_id, changes=changes, captured_at=captured_at,
+    )
 
 
 @router.get(

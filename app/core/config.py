@@ -32,11 +32,29 @@ class Settings(BaseSettings):
     ACCESS_TOKEN_EXPIRE_MINUTES: int = 15
     REFRESH_TOKEN_EXPIRE_DAYS: int = 7
 
-    # Auth cookie config. COOKIE_SECURE must be True in production (HTTPS).
+    # Auth cookie config. COOKIE_SECURE is auto-forced True in production (see
+    # effective_cookie_secure); this raw value only applies outside production.
     AUTH_COOKIE_NAME: str = "access_token"
     AUTH_REFRESH_COOKIE_NAME: str = "refresh_token"
     COOKIE_SECURE: bool = False
     COOKIE_SAMESITE: str = "lax"
+
+    # ── Security hardening ────────────────────────────────────────────────
+    # Response security headers (nosniff, frame-deny, referrer policy, CSP,
+    # and HSTS in production). Off only for debugging. See app/api/security_headers.py.
+    SECURITY_HEADERS_ENABLED: bool = True
+    # Rate limiting (in-process, per-client-IP fixed windows). The auth window
+    # guards /auth/login|register|refresh against brute force; the global window
+    # is a coarse flood guard across every endpoint. See app/api/rate_limit.py.
+    RATE_LIMIT_ENABLED: bool = True
+    RATE_LIMIT_AUTH_MAX: int = 10          # requests per window per IP on auth routes
+    RATE_LIMIT_AUTH_WINDOW_SECONDS: int = 60
+    RATE_LIMIT_GLOBAL_MAX: int = 300       # requests per window per IP, all routes
+    RATE_LIMIT_GLOBAL_WINDOW_SECONDS: int = 60
+    # Trust X-Forwarded-For for the client IP. Enable ONLY behind a trusted
+    # reverse proxy (e.g. nginx) — otherwise clients can spoof the header and
+    # evade the limiter. When off, the socket peer IP is used.
+    TRUST_PROXY_HEADERS: bool = False
 
     # Google PageSpeed Insights API key (optional; PSI works keyless but is
     # heavily rate-limited without one). Get one at https://developers.google.com/speed/docs/insights/v5/get-started
@@ -116,6 +134,24 @@ class Settings(BaseSettings):
     @property
     def openai_configured(self) -> bool:
         return bool(self.OPENAI_API_KEY)
+
+    # When true, every AI call logs its prompts (system + user), request
+    # parameters and the raw model output via the "app.ai" logger.
+    # Dev-only switch — keep off in production (prompts/outputs are verbose and
+    # may contain user content). Set AI_DEBUG=true in the backend .env.
+    AI_DEBUG: bool = False
+    # Root log level for the app ("DEBUG", "INFO", "WARNING", ...).
+    LOG_LEVEL: str = "INFO"
+    # When set, AI + API debug blocks are ALSO written (appended) to this file
+    # with rotation. Empty = console only. E.g. AI_LOG_FILE=logs/debug.log
+    AI_LOG_FILE: str = ""
+    # When true, every API request/response is logged (method, path, query,
+    # body in + status, duration, body out) via the "app.api" logger. Bodies are
+    # redacted (passwords/tokens) and truncated. Dev-first default; set
+    # HTTP_DEBUG=false in production (it logs user content on every request).
+    HTTP_DEBUG: bool = True
+    # Max characters of any request/response body logged (truncate beyond).
+    HTTP_LOG_MAX_BODY: int = 2000
 
     # Stripe billing (optional). When keys are unset, plan selection/upgrades
     # work locally (a free plan, or a 1-year trial on paid plans) with no
@@ -202,6 +238,30 @@ class Settings(BaseSettings):
     @property
     def is_production(self) -> bool:
         return self.APP_ENV.strip().lower() == "production"
+
+    # ── Production-forced safety overrides ────────────────────────────────
+    # In production these are locked to the safe value regardless of the raw
+    # setting, so a stale .env can't ship an insecure cookie or leak user
+    # content / API internals. Outside production the raw setting is honoured.
+    @property
+    def effective_cookie_secure(self) -> bool:
+        """Session cookies are always Secure (HTTPS-only) in production."""
+        return self.COOKIE_SECURE or self.is_production
+
+    @property
+    def effective_http_debug(self) -> bool:
+        """Full request/response body logging is forced off in production."""
+        return self.HTTP_DEBUG and not self.is_production
+
+    @property
+    def effective_ai_debug(self) -> bool:
+        """AI prompt/output logging is forced off in production."""
+        return self.AI_DEBUG and not self.is_production
+
+    @property
+    def docs_enabled(self) -> bool:
+        """Swagger / ReDoc / openapi.json are served only outside production."""
+        return not self.is_production
 
     @property
     def dataforseo_sandbox_allowed(self) -> bool:

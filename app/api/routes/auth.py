@@ -7,6 +7,7 @@ from fastapi.responses import JSONResponse
 from sqlalchemy.orm import Session
 
 from app.api.deps import get_current_user
+from app.api.rate_limit import auth_rate_limit
 from app.core.config import settings
 from app.core.security import create_access_token
 from app.db.session import get_db
@@ -36,7 +37,7 @@ def _set_access_cookie(response: Response, token: str) -> None:
         value=token,
         max_age=settings.ACCESS_TOKEN_EXPIRE_MINUTES * 60,
         httponly=True,
-        secure=settings.COOKIE_SECURE,
+        secure=settings.effective_cookie_secure,
         samesite=settings.COOKIE_SAMESITE,
         path="/",
     )
@@ -48,7 +49,7 @@ def _set_refresh_cookie(response: Response, token: str) -> None:
         value=token,
         max_age=settings.REFRESH_TOKEN_EXPIRE_DAYS * 24 * 60 * 60,
         httponly=True,
-        secure=settings.COOKIE_SECURE,
+        secure=settings.effective_cookie_secure,
         samesite=settings.COOKIE_SAMESITE,
         path="/",
     )
@@ -60,7 +61,7 @@ def _clear_auth_cookies(response: Response) -> None:
             key=name,
             path="/",
             httponly=True,
-            secure=settings.COOKIE_SECURE,
+            secure=settings.effective_cookie_secure,
             samesite=settings.COOKIE_SAMESITE,
         )
 
@@ -76,9 +77,11 @@ def _issue_session(response: Response, db: Session, user: User) -> None:
     response_model=UserResponse,
     status_code=status.HTTP_201_CREATED,
     summary="Register a new user account",
+    dependencies=[Depends(auth_rate_limit)],
     responses={
         409: {"description": "An account with this email already exists"},
         422: {"description": "Validation error"},
+        429: {"description": "Too many attempts"},
     },
 )
 def register(payload: RegisterRequest, db: Session = Depends(get_db)) -> UserResponse:
@@ -137,9 +140,11 @@ def _rollback_partial_registration(db: Session, user: User) -> None:
     "/login",
     response_model=LoginResponse,
     summary="Log in and receive session cookies",
+    dependencies=[Depends(auth_rate_limit)],
     responses={
         401: {"description": "Invalid email or password"},
         422: {"description": "Validation error"},
+        429: {"description": "Too many attempts"},
     },
 )
 def login(
@@ -165,7 +170,11 @@ def login(
     "/refresh",
     response_model=LoginResponse,
     summary="Rotate the refresh token and issue a new access token",
-    responses={401: {"description": "Invalid or expired refresh token"}},
+    dependencies=[Depends(auth_rate_limit)],
+    responses={
+        401: {"description": "Invalid or expired refresh token"},
+        429: {"description": "Too many attempts"},
+    },
 )
 def refresh(
     request: Request,

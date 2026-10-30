@@ -7,13 +7,16 @@ keyword reports:
   * POST /competitors/refresh  — recompute + persist today's real snapshot
 """
 
-from fastapi import APIRouter, Depends, HTTPException, Query, status
+import logging
+
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, status
 from sqlalchemy.orm import Session
 
 from app.api.deps import DomainContext, get_domain_context
 from app.api.errors import upstream_error
 from app.db.session import get_db
 from app.schemas.competitor import (
+    BusinessProfileResponse,
     CompetitorCreate,
     CompetitorDiscoverRequest,
     CompetitorDiscoverResponse,
@@ -23,10 +26,13 @@ from app.schemas.competitor import (
     CompetitorSuggestionsResponse,
     CuratedCompetitor,
     CuratedCompetitorsResponse,
+    DiscoveryJobOut,
 )
 from app.services import competitor_service
 from app.services.competitor_service import CompetitorError
 from app.services.competitor_discovery_service import DiscoveryError
+
+log = logging.getLogger("app.api")
 
 router = APIRouter(
     prefix="/workspaces/{workspace_id}/domains/{domain_id}",
@@ -87,29 +93,101 @@ def delete_curated(
         )
 
 
+def _job_out(job) -> DiscoveryJobOut:
+    return DiscoveryJobOut(
+        job_id=str(job.id), status=job.status, step=job.step,
+        step_label=job.step_label, total_steps=job.total_steps,
+        count=job.count, error=job.error,
+    )
+
+
 @router.post(
     "/competitors/discover",
-    response_model=CompetitorDiscoverResponse,
-    summary="LLM: find top competitors for a domain and store them",
-    responses={
-        404: {"description": "Domain not found"},
-        503: {"description": "LLM not configured / discovery failed"},
-    },
+    response_model=DiscoveryJobOut,
+    summary="Start async competitor discovery; poll the job for live progress",
+    responses={404: {"description": "Domain not found"}},
 )
 def discover(
     payload: CompetitorDiscoverRequest,
+    background_tasks: BackgroundTasks,
     ctx: DomainContext = Depends(get_domain_context),
     db: Session = Depends(get_db),
-) -> CompetitorDiscoverResponse:
+) -> DiscoveryJobOut:
+    """Starts discovery in the background and returns a job to poll. The 3-agent
+    pipeline (~1-2 min) runs server-side, updating the job's step as it goes, so a
+    long request never ties up (or is reset by) the connection."""
+    # If a run is already in flight for this domain, return it instead of starting
+    # a duplicate.
+    existing = competitor_service.active_discovery_job(db, ctx.domain)
+    if existing is not None:
+        return _job_out(existing)
+
+    job = competitor_service.create_discovery_job(db, ctx.domain)
+    background_tasks.add_task(
+        competitor_service.run_discovery_job,
+        ctx.workspace.id, ctx.domain.id, job.id,
+        target_domain=payload.target_domain, limit=payload.limit,
+        extra_services=payload.extra_services, refresh=payload.refresh,
+    )
+    return _job_out(job)
+
+
+@router.get(
+    "/competitors/discover/{job_id}",
+    response_model=DiscoveryJobOut,
+    summary="Poll an async discovery job for live step progress",
+    responses={404: {"description": "Job not found"}},
+)
+def discover_status(
+    job_id: str,
+    ctx: DomainContext = Depends(get_domain_context),
+    db: Session = Depends(get_db),
+) -> DiscoveryJobOut:
+    job = competitor_service.get_discovery_job(db, job_id)
+    if job is None or job.domain_id != ctx.domain.id:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Job not found")
+    return _job_out(job)
+
+
+@router.get(
+    "/competitors/business-profile",
+    response_model=BusinessProfileResponse,
+    summary="Business profile extracted from the site (first pass of discovery)",
+    responses={404: {"description": "Domain not found"}},
+)
+def business_profile(
+    ctx: DomainContext = Depends(get_domain_context),
+    db: Session = Depends(get_db),
+) -> BusinessProfileResponse:
+    return BusinessProfileResponse(
+        **competitor_service.get_business_profile(db, ctx.domain)
+    )
+
+
+@router.post(
+    "/competitors/business-profile/refresh",
+    response_model=BusinessProfileResponse,
+    summary="Re-extract only the business profile (re-scrape the site)",
+    responses={
+        404: {"description": "Domain not found"},
+        503: {"description": "LLM not configured / extraction failed"},
+    },
+)
+def refresh_business_profile(
+    ctx: DomainContext = Depends(get_domain_context),
+    db: Session = Depends(get_db),
+) -> BusinessProfileResponse:
     try:
-        result = competitor_service.discover_and_store(
-            db, ctx.domain,
-            target_domain=payload.target_domain, limit=payload.limit,
-            extra_services=payload.extra_services,
-        )
+        result = competitor_service.refresh_business_profile(db, ctx.domain)
+        return BusinessProfileResponse(**result)
     except DiscoveryError as exc:
-        raise upstream_error(exc, "We couldn't find competitors right now. Please try again in a few minutes.") from exc
-    return CompetitorDiscoverResponse(**result)
+        raise upstream_error(exc, "We couldn't refresh your business profile right now. Please try again in a few minutes.") from exc
+    except HTTPException:
+        raise
+    except Exception as exc:  # noqa: BLE001 — never leak a raw 500 to the UI
+        db.rollback()
+        log.exception("business profile refresh failed for domain %s", ctx.domain.id)
+        raise upstream_error(exc, "We couldn't refresh your business profile right now. Please try again in a few minutes.") from exc
 
 
 @router.get(

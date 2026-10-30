@@ -35,10 +35,18 @@ def chat_json(system: str, user: str, *, model: str | None = None,
         raise OpenAiError("OpenAI is not configured (set OPENAI_API_KEY in the backend .env).")
     from openai import OpenAI
 
+    from app.services import ai_debug
+
+    used_model = model or settings.AI_TEXT_MODEL
+    ai_debug.log_call(
+        "openai_ai.chat_json", system=system, user=user,
+        params={"model": used_model, "max_tokens": max_tokens,
+                "temperature": temperature, "response_format": "json_object"},
+    )
     client = OpenAI(api_key=settings.OPENAI_API_KEY, timeout=timeout, max_retries=1)
     try:
         resp = client.chat.completions.create(
-            model=model or settings.AI_TEXT_MODEL,
+            model=used_model,
             messages=[{"role": "system", "content": system}, {"role": "user", "content": user}],
             response_format={"type": "json_object"},
             max_tokens=max_tokens,
@@ -48,6 +56,7 @@ def chat_json(system: str, user: str, *, model: str | None = None,
         raise OpenAiError(f"OpenAI request failed: {exc.__class__.__name__}") from exc
 
     text = (resp.choices[0].message.content or "").strip()
+    ai_debug.log_call("openai_ai.chat_json", output=text)
     try:
         data = json.loads(text)
     except json.JSONDecodeError as exc:

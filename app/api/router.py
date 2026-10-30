@@ -10,6 +10,7 @@ from app.api.routes import (
     categories,
     competitors,
     content_optimization,
+    domain_score,
     pages,
     my_keywords,
     gsc,
@@ -52,3 +53,4 @@ api_router.include_router(serp.router)
 api_router.include_router(ai_overview.router)
 api_router.include_router(backlinks.router)
 api_router.include_router(page_discovery.router)
+api_router.include_router(domain_score.router)

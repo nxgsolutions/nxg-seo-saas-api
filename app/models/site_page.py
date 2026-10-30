@@ -65,12 +65,15 @@ class PageSnapshot(Base):
     workspace_id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), ForeignKey("workspaces.id", ondelete="CASCADE"), nullable=False, index=True)
     captured_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
-    # audit | content | inspect — which tool fetched the page; source_id = its run id.
+    # audit | content | inspect | score — which tool fetched the page; source_id = its run id.
     source: Mapped[str] = mapped_column(String(20), nullable=False)
     source_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
     device: Mapped[str | None] = mapped_column(String(10), nullable=True)
     audit_score: Mapped[int | None] = mapped_column(Integer, nullable=True)
     content_score: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # Overall page SEO score (0-100) + per-category breakdown, from a "score" run.
+    overall_score: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    category_scores: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
     keyword: Mapped[str | None] = mapped_column(String(255), nullable=True)
     # On-page facts (title, meta, h1, headings, word count, links, images …).
     facts: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict)

@@ -19,16 +19,46 @@ from bs4 import BeautifulSoup
 MAX_REDIRECTS = 5
 FETCH_TIMEOUT_SECONDS = 12.0
 MAX_HTML_BYTES = 3_000_000  # cap parsing work
-_USER_AGENT = "BrightEdgeAuditBot/1.0 (+page-audit)"
 
+# Realistic mainstream-browser User-Agents (no bot suffix): many WAFs / CDNs
+# reject anything that isn't a recognised browser string, so reading a page as
+# a plain bot gets a 403/503. We read pages the way a visitor's browser does.
+_CHROME_VERSION = "124"
 DESKTOP_UA = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/124.0 Safari/537.36 BrightEdgeAuditBot/1.0"
+    f"(KHTML, like Gecko) Chrome/{_CHROME_VERSION}.0.0.0 Safari/537.36"
 )
 MOBILE_UA = (
     "Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/124.0 Mobile Safari/537.36 BrightEdgeAuditBot/1.0"
+    f"(KHTML, like Gecko) Chrome/{_CHROME_VERSION}.0.0.0 Mobile Safari/537.36"
 )
+_USER_AGENT = DESKTOP_UA  # default reader identity
+
+# Statuses that mean "a firewall/bot-protection blocked us", not "page is down".
+_BLOCK_STATUS = (401, 403, 429, 503)
+
+
+def _browser_headers(user_agent: str) -> dict[str, str]:
+    """A full set of browser-like request headers. Sending only User-Agent is a
+    common bot tell that trips WAFs; a real browser also sends these."""
+    mobile = "Mobile" in user_agent or "Android" in user_agent
+    return {
+        "User-Agent": user_agent,
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,"
+                  "image/avif,image/webp,image/apng,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+        # Only encodings httpx decodes without extra packages (no brotli).
+        "Accept-Encoding": "gzip, deflate",
+        "Sec-CH-UA": f'"Chromium";v="{_CHROME_VERSION}", '
+                     f'"Google Chrome";v="{_CHROME_VERSION}", "Not-A.Brand";v="99"',
+        "Sec-CH-UA-Mobile": "?1" if mobile else "?0",
+        "Sec-CH-UA-Platform": '"Android"' if mobile else '"Windows"',
+        "Sec-Fetch-Dest": "document",
+        "Sec-Fetch-Mode": "navigate",
+        "Sec-Fetch-Site": "none",
+        "Sec-Fetch-User": "?1",
+        "Upgrade-Insecure-Requests": "1",
+    }
 
 # Page speed: bound the PSI call lower than the standalone tool so an audit
 # stays responsive and falls back to the raw fetch time when PSI is slow.
@@ -127,11 +157,10 @@ def _friendly_fetch_error(exc: httpx.HTTPError) -> str:
     return "Could not fetch the page. Check the URL and try again."
 
 
-def _fetch(url: str, user_agent: str = _USER_AGENT) -> tuple[httpx.Response, str, int]:
-    """Fetch with manual, host-validated redirects. Returns (response, final_url, elapsed_ms)."""
+def _fetch_once(url: str, headers: dict[str, str]) -> tuple[httpx.Response, str, int]:
+    """One attempt: manual, host-validated redirects. Returns (response, final_url, elapsed_ms)."""
     current = url
     start = time.perf_counter()
-    headers = {"User-Agent": user_agent, "Accept": "text/html,*/*"}
 
     with httpx.Client(
         follow_redirects=False, timeout=FETCH_TIMEOUT_SECONDS, headers=headers
@@ -155,6 +184,35 @@ def _fetch(url: str, user_agent: str = _USER_AGENT) -> tuple[httpx.Response, str
             return response, current, elapsed_ms
 
     raise FetchError("Too many redirects.")
+
+
+FETCH_RETRIES = 2  # extra attempts after the first when a WAF blocks us
+
+
+def _fetch(url: str, user_agent: str = _USER_AGENT) -> tuple[httpx.Response, str, int]:
+    """Fetch a page as a browser would (full headers). Bot-protection services
+    (e.g. Cloudflare Bot Fight Mode) intermittently answer a browser request
+    with a 401/403/429/503 challenge, so when that happens we retry a few times
+    with a short backoff, alternating the browser UA and adding a search-engine
+    referer. Connection errors are not retried. Returns (response, final_url, ms)."""
+    response, final_url, elapsed = _fetch_once(url, _browser_headers(user_agent))
+    if response.status_code not in _BLOCK_STATUS:
+        return response, final_url, elapsed
+
+    uas = [MOBILE_UA if user_agent != MOBILE_UA else DESKTOP_UA, user_agent]
+    for attempt in range(FETCH_RETRIES):
+        time.sleep(0.5 * (attempt + 1))
+        headers = _browser_headers(uas[attempt % len(uas)])
+        headers["Referer"] = "https://www.google.com/"
+        try:
+            r2, final2, elapsed2 = _fetch_once(url, headers)
+        except FetchError:
+            break  # connection error on retry — keep the first (clearer) result
+        elapsed += elapsed2
+        if r2.status_code not in _BLOCK_STATUS:
+            return r2, final2, elapsed
+        response, final_url = r2, final2  # keep the latest block to report
+    return response, final_url, elapsed
 
 
 def safe_fetch(url: str) -> tuple[httpx.Response, str, int]:

@@ -11,6 +11,7 @@ to WRITE suggestions (titles, meta, outline, intro) — never to score.
 
 from __future__ import annotations
 
+import json as _json
 import math
 import re
 import statistics
@@ -88,6 +89,50 @@ def _host(url: str) -> str:
 
 # ── Extraction ──────────────────────────────────────────────────────────────
 
+# How few DOM words before we fall back to structured-data copy.
+_THIN_BODY_WORDS = 50
+
+
+def _structured_text(soup: BeautifulSoup) -> str:
+    """The copy search engines read from the page even when the visible body is
+    rendered by JavaScript: the ``description`` of any JSON-LD object (Product,
+    Article, …) plus the ``og:description``.
+
+    JS-rendered storefronts (Shopify/React themes, etc.) often ship only a
+    loading splash in their static HTML while the full product/article text lives
+    in structured data. Must be called BEFORE chrome stripping, which removes the
+    <script type="application/ld+json"> tags this reads.
+    """
+    parts: list[str] = []
+    for tag in soup.find_all("script", attrs={"type": re.compile("ld\\+json", re.I)}):
+        try:
+            data = _json.loads(tag.string or "")
+        except Exception:  # noqa: BLE001 — malformed JSON-LD is ignored, not fatal
+            continue
+        stack: list[Any] = [data]
+        while stack:
+            node = stack.pop()
+            if isinstance(node, dict):
+                desc = node.get("description")
+                if isinstance(desc, str) and desc.strip():
+                    # Descriptions may contain HTML markup — keep the text only.
+                    parts.append(BeautifulSoup(desc, "html.parser").get_text(" ", strip=True))
+                stack.extend(node.values())
+            elif isinstance(node, list):
+                stack.extend(node)
+    og = soup.find("meta", attrs={"property": re.compile("^og:description$", re.I)})
+    if og and (og.get("content") or "").strip():
+        parts.append(og["content"].strip())
+    seen: set[str] = set()
+    out: list[str] = []
+    for p in parts:
+        key = re.sub(r"\s+", " ", p).strip()[:160].lower()
+        if key and key not in seen:
+            seen.add(key)
+            out.append(re.sub(r"\s+", " ", p).strip())
+    return " ".join(out)
+
+
 def _content_root(soup: BeautifulSoup):
     """The element the page's content lives in, measured after chrome is removed.
 
@@ -114,6 +159,8 @@ def extract(html: str, url: str) -> dict[str, Any]:
     desc = soup.find("meta", attrs={"name": re.compile("^description$", re.I)})
     meta = (desc.get("content", "") if desc else "").strip()[:400]
     has_schema = bool(soup.find("script", attrs={"type": "application/ld+json"}))
+    # Read structured-data copy now, before chrome stripping removes <script> tags.
+    structured = _structured_text(soup)
 
     # Everything below is measured on the article only — menus, headers and
     # footers are removed so site-wide links and boilerplate don't count.
@@ -142,6 +189,11 @@ def extract(html: str, url: str) -> dict[str, Any]:
     paragraphs = [p.get_text(" ", strip=True) for p in root.find_all("p")]
     paragraphs = [p for p in paragraphs if len(p.split()) >= 5]
     body = re.sub(r"\s+", " ", root.get_text(" ", strip=True))
+    # JS-rendered pages (e.g. Shopify/React storefronts) ship only a loading
+    # splash in static HTML, so the visible body is near-empty. Recover the copy
+    # that search engines read from structured data so the page is still scorable.
+    if len(words(body)) < _THIN_BODY_WORDS and structured:
+        body = f"{body} {structured}".strip() if body else structured
     first = next((p for p in paragraphs if len(p.split()) >= 12), " ".join(body.split()[:100]))
 
     internal = external = 0

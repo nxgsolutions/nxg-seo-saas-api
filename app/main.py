@@ -6,12 +6,16 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
+from app.api.logging_middleware import ApiLoggingMiddleware
+from app.api.rate_limit import RateLimitMiddleware
 from app.api.router import api_router
+from app.api.security_headers import SecurityHeadersMiddleware
 from app.core.config import settings
+from app.core.logging_config import configure_logging
 from app.db.session import SessionLocal
 from app.services import billing_service, category_service
 
-logging.basicConfig(level=logging.INFO)
+configure_logging()
 logger = logging.getLogger(__name__)
 
 
@@ -32,12 +36,31 @@ async def lifespan(app: FastAPI):
     yield
 
 
+# Interactive API docs + the OpenAPI schema are served only outside production
+# (in prod they would expose the full API surface to anyone). None disables them.
 app = FastAPI(
     title=settings.PROJECT_NAME,
-    docs_url="/docs",
-    openapi_url="/openapi.json",
+    docs_url="/docs" if settings.docs_enabled else None,
+    redoc_url="/redoc" if settings.docs_enabled else None,
+    openapi_url="/openapi.json" if settings.docs_enabled else None,
     lifespan=lifespan,
 )
+
+# Middleware order note: Starlette applies the LAST-added middleware outermost,
+# so the registration order below is inner -> outer. The effective wrapping is:
+#   CORS -> SecurityHeaders -> RateLimit -> ApiLogging -> routes
+# CORS stays outermost so even a 429 / error response carries CORS headers;
+# SecurityHeaders sits just inside it so its headers survive onto every response.
+
+# Per-request flow logging (gated by settings.HTTP_DEBUG) — innermost; wraps the
+# actual route handling.
+app.add_middleware(ApiLoggingMiddleware)
+
+# Coarse per-IP flood guard across every route (gated by RATE_LIMIT_ENABLED).
+app.add_middleware(RateLimitMiddleware)
+
+# Defensive response headers (gated by SECURITY_HEADERS_ENABLED).
+app.add_middleware(SecurityHeadersMiddleware)
 
 app.add_middleware(
     CORSMiddleware,

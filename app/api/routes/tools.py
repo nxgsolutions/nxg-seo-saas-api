@@ -22,6 +22,12 @@ from app.schemas.ai import (
     MetaSuggestResponse,
 )
 from app.schemas.optimization import OptimizeRequest, OptimizeResponse
+from app.schemas.page_score import (
+    PageScoreRequest,
+    PageScoreResponse,
+    ScoreCategoryOut,
+    ScoreCheckOut,
+)
 from app.schemas.psi import PsiRequest, PsiResponse
 from app.services import (
     ai_service,
@@ -32,6 +38,7 @@ from app.services import (
     keyword_planner_service,
     meta_service,
     optimization_service,
+    page_score_service,
     psi_service,
 )
 from app.services.keyword_planner_service import NotConfiguredError, PlannerError
@@ -84,6 +91,36 @@ def page_audit(
         ],
         metrics=result.metrics,
     )
+
+
+@router.post(
+    "/page-score",
+    response_model=PageScoreResponse,
+    summary="Overall SEO score for a web page (0-100 with category breakdown)",
+    responses={
+        400: {"description": "The page could not be fetched"},
+        422: {"description": "Invalid or disallowed URL"},
+    },
+)
+def page_score(
+    payload: PageScoreRequest,
+    _current_user: User = Depends(get_current_user),
+) -> PageScoreResponse:
+    """One weighted 0-100 combining technical, on-page, content, performance,
+    links/images and structured data. Fetches the page once server-side."""
+    try:
+        result = page_score_service.run_page_score(
+            payload.url, keyword=payload.keyword, device=payload.device
+        )
+    except (InvalidUrlError, BlockedUrlError) as exc:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(exc)
+        )
+    except FetchError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)
+        )
+    return PageScoreResponse.from_result(result)
 
 
 @router.post(

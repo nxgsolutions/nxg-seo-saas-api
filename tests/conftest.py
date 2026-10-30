@@ -13,8 +13,17 @@ import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy.orm import Session
 
+from app.api.rate_limit import rate_limiter
 from app.db.session import engine, get_db
 from app.main import app
+
+
+@pytest.fixture(autouse=True)
+def _reset_rate_limiter() -> Generator[None, None, None]:
+    """Clear the in-process rate-limit counters before every test so per-IP
+    windows never bleed across tests (the whole suite shares one client IP)."""
+    rate_limiter.reset()
+    yield
 
 
 @pytest.fixture

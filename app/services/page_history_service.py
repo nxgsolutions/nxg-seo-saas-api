@@ -218,6 +218,7 @@ def get_or_create_page(db: Session, workspace: Workspace, url: str, *, title: st
 def record(db: Session, workspace: Workspace, url: str, *, html: str | None = None, extracted: dict | None = None,
            source: str, source_id: uuid.UUID | None = None, device: str | None = None,
            audit_score: int | None = None, content_score_value: int | None = None, keyword: str | None = None,
+           overall_score: int | None = None, category_scores: dict | None = None,
            tech: dict | None = None, checks: list[dict] | None = None,
            captured_at: datetime | None = None, commit: bool = True) -> PageSnapshot:
     """Store a snapshot of the page (call after any successful fetch)."""
@@ -244,6 +245,7 @@ def record(db: Session, workspace: Workspace, url: str, *, html: str | None = No
     snap = PageSnapshot(
         page_id=page.id, workspace_id=workspace.id, source=source, source_id=source_id, device=device,
         audit_score=audit_score, content_score=content_score_value, keyword=keyword,
+        overall_score=overall_score, category_scores=category_scores,
         facts=facts, tech=tech, checks=checks, content_hash=cur["content_hash"], body_text=body or None,
         changes=changes, captured_at=captured_at or datetime.now(timezone.utc),
     )
@@ -342,7 +344,8 @@ def timeline(db: Session, workspace: Workspace, page: SitePage, limit: int = 100
                        .order_by(PageSnapshot.captured_at.desc()).limit(limit)).scalars().all()
     return [{"id": str(s.id), "captured_at": s.captured_at, "source": s.source,
              "source_id": str(s.source_id) if s.source_id else None, "device": s.device,
-             "audit_score": s.audit_score, "content_score": s.content_score, "keyword": s.keyword,
+             "audit_score": s.audit_score, "content_score": s.content_score,
+             "overall_score": s.overall_score, "category_scores": s.category_scores, "keyword": s.keyword,
              "facts": s.facts, "tech": s.tech, "changes": s.changes or []} for s in snaps]
 
 
