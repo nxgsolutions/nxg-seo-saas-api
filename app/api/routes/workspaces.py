@@ -319,12 +319,21 @@ def run_page_audit(
             status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)
         )
 
-    record = page_audit_service.save_audit(db, ctx.workspace, current_user, result)
+    # Compose the genuine overall SEO score + category breakdown from this audit
+    # (no extra fetch) and persist them on the audit, so one saved audit carries
+    # the score, the breakdown and the fixes — and the Discovery column stays
+    # consistent with the Page Score tool.
+    ps = page_score_service.compose(result)
+    cats = [{"id": c.id, "label": c.label, "weight": c.weight, "score": c.score,
+             "checks": [{"id": k.id, "label": k.label, "status": k.status, "detail": k.detail, "tip": k.tip}
+                        for k in c.checks]}
+            for c in ps.categories]
+    record = page_audit_service.save_audit(
+        db, ctx.workspace, current_user, result,
+        overall_score=ps.overall, categories=cats, blockers=ps.blockers,
+    )
     # Page history: timestamped snapshot + what changed since the last check.
     checks = [{"id": c.id, "label": c.label, "status": c.status} for c in result.checks]
-    # Compose the genuine overall SEO score from this audit (no extra fetch) so
-    # the Discovery column stays consistent with the Page Score tool.
-    ps = page_score_service.compose(result)
     page_history_service.safe_record(
         db, ctx.workspace, result.final_url, html=result.html, source="audit", source_id=record.id,
         device=payload.device, audit_score=result.score,
@@ -373,7 +382,14 @@ def get_page_audit(
 
 def _audit_out(db: Session, ctx: WorkspaceContext, record) -> PageAuditDetail:
     """An audit + its page-history link and the changes found since the page's previous check."""
-    out = PageAuditDetail.model_validate(record)
+    out = PageAuditDetail(
+        id=record.id, url=record.url, score=record.score, status_code=record.status_code,
+        load_time_ms=record.load_time_ms, page_size_bytes=record.page_size_bytes,
+        checks=record.checks, metrics=record.metrics, created_at=record.created_at,
+        overall=record.overall_score,
+        categories=record.category_scores or [],
+        blockers=record.blockers or [],
+    )
     out.page_id, out.changes = page_history_service.for_run(db, ctx.workspace, record.id)
     return out
 

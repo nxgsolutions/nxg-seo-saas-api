@@ -41,6 +41,14 @@ class PageAudit(Base):
     checks: Mapped[list[dict[str, Any]]] = mapped_column(JSONB, nullable=False)
     metrics: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False)
 
+    # Genuine overall SEO score + per-category breakdown + blocking problems,
+    # computed by page_score_service.compose at save time (migration 0051). One
+    # saved audit powers the score, the breakdown and the fixes. Nullable: audits
+    # saved before 0051 have none.
+    overall_score: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    category_scores: Mapped[list[dict[str, Any]] | None] = mapped_column(JSONB, nullable=True)
+    blockers: Mapped[list[str] | None] = mapped_column(JSONB, nullable=True)
+
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         nullable=False,
@@ -48,6 +56,11 @@ class PageAudit(Base):
     )
 
     workspace = relationship("Workspace")
+
+    @property
+    def overall(self) -> int | None:
+        """The genuine overall score for history lists (alias of overall_score)."""
+        return self.overall_score
 
     def __repr__(self) -> str:  # pragma: no cover
         return f"<PageAudit id={self.id} score={self.score} url={self.url!r}>"

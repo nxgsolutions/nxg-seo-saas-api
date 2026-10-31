@@ -65,6 +65,12 @@ def test_run_audit_saves_and_returns_detail(client: TestClient, stub_audit) -> N
     assert body["checks"][0]["id"] == "https"
     assert body["metrics"]["title"] == "Example"
     assert "id" in body and body["id"]
+    # One saved audit now also carries the genuine overall score, the category
+    # breakdown and any blocking problems (so Page score / Fix plan fold in).
+    assert isinstance(body["overall"], int)
+    assert body["categories"] and {c["id"] for c in body["categories"]} >= {"content", "technical"}
+    assert sum(c["weight"] for c in body["categories"]) == 100
+    assert isinstance(body["blockers"], list)
 
 
 def test_audit_appears_in_history(client: TestClient, stub_audit) -> None:
@@ -80,6 +86,7 @@ def test_audit_appears_in_history(client: TestClient, stub_audit) -> None:
     # Summary rows omit heavy fields.
     assert "checks" not in rows[0]
     assert rows[0]["score"] == 88
+    assert "overall" in rows[0]  # genuine score shown in history lists
 
 
 def test_get_saved_audit_detail(client: TestClient, stub_audit) -> None:
@@ -91,7 +98,11 @@ def test_get_saved_audit_detail(client: TestClient, stub_audit) -> None:
 
     resp = client.get(f"{WORKSPACES_URL}/{wid}/page-audits/{created['id']}")
     assert resp.status_code == 200
-    assert resp.json()["checks"][0]["label"] == "Served over HTTPS"
+    detail = resp.json()
+    assert detail["checks"][0]["label"] == "Served over HTTPS"
+    # Reopening a saved audit returns the same genuine score + breakdown.
+    assert detail["overall"] == created["overall"]
+    assert len(detail["categories"]) == len(created["categories"])
 
 
 def test_unknown_audit_returns_404(client: TestClient, stub_audit) -> None:

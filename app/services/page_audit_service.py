@@ -15,9 +15,15 @@ MAX_HISTORY_PER_WORKSPACE = 50
 
 
 def save_audit(
-    db: Session, workspace: Workspace, user: User, result: AuditResult
+    db: Session, workspace: Workspace, user: User, result: AuditResult,
+    *, overall_score: int | None = None,
+    categories: list[dict] | None = None, blockers: list[str] | None = None,
 ) -> PageAudit:
-    """Persist an audit result and prune old history for the workspace."""
+    """Persist an audit result and prune old history for the workspace.
+
+    ``overall_score`` / ``categories`` / ``blockers`` are the genuine page-score
+    breakdown (from page_score_service.compose) so one saved audit carries the
+    score, the category breakdown and the blocking problems."""
     record = PageAudit(
         workspace_id=workspace.id,
         user_id=user.id,
@@ -31,6 +37,9 @@ def save_audit(
             for c in result.checks
         ],
         metrics=result.metrics,
+        overall_score=overall_score,
+        category_scores=categories,
+        blockers=blockers,
     )
     db.add(record)
     db.commit()
