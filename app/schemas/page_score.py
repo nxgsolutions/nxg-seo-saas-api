@@ -49,6 +49,9 @@ class PageScoreResponse(BaseModel):
     page_size_bytes: int
     keyword: str
     overall: int
+    # Blocking problems that capped the score (noindex, non-200, no title/H1,
+    # severely thin). Empty when none. The UI explains why a score is low.
+    blockers: list[str] = []
     categories: list[ScoreCategoryOut]
     metrics: dict[str, Any] = {}
     # Real-world performance (GSC) — context only, present when connected.
@@ -73,6 +76,7 @@ class PageScoreResponse(BaseModel):
             page_size_bytes=result.page_size_bytes,
             keyword=result.keyword,
             overall=result.overall,
+            blockers=list(getattr(result, "blockers", []) or []),
             categories=[
                 ScoreCategoryOut(
                     id=cat.id, label=cat.label, weight=cat.weight, score=cat.score,

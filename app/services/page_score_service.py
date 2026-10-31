@@ -21,33 +21,36 @@ from typing import Any
 from app.services import audit_service, content_score
 
 # Product weights (sum to 100). These are a scoring opinion, not a Google formula.
+# Content-led, per the on-page SEO methodology (content quality is where rankings
+# are won). Core Web Vitals / PageSpeed is NOT a category here — it is context
+# only (see cwv_context), so a fast but thin page can't score well on speed alone.
 CATEGORY_WEIGHTS: dict[str, int] = {
-    "technical": 25,
+    "content": 35,
     "onpage": 25,
-    "content": 20,
-    "performance": 15,
-    "links_images": 10,
-    "structured": 5,
+    "technical": 20,
+    "links_images": 12,
+    "structured": 8,
 }
 
 CATEGORY_LABELS: dict[str, str] = {
-    "technical": "Technical SEO",
-    "onpage": "On-page SEO",
     "content": "Content quality",
-    "performance": "Performance & mobile",
+    "onpage": "On-page SEO",
+    "technical": "Technical SEO",
     "links_images": "Links & images",
     "structured": "Structured data",
 }
 
 # Which category each audit check belongs to. Unknown ids fall back to on-page
 # (most audit_details evidence checks are on-page), so new checks still score.
+# Mobile viewport and HTML size are technical hygiene (no `performance` category
+# now; `speed`/CWV is no longer a scored check at all).
 _AUDIT_CATEGORY: dict[str, str] = {
     "status": "technical", "https": "technical", "canonical": "technical",
     "canonical_invalid": "technical", "duplicate_link": "technical",
     "lang": "technical", "indexable": "technical", "charset": "technical",
+    "viewport": "technical", "size": "technical",
     "title": "onpage", "description": "onpage", "h1": "onpage", "og": "onpage",
     "duplicate_title": "onpage", "duplicate_meta": "onpage", "heading_order": "onpage",
-    "speed": "performance", "viewport": "performance", "size": "performance",
     "img_alt": "links_images",
     "schema": "structured", "schema_invalid": "structured", "article_schema": "structured",
 }
@@ -99,6 +102,8 @@ class PageScoreResult:
     # Reference numbers from the underlying engines (for reconciliation/debugging).
     audit_score: int
     content_score: int
+    # Blocking problems that capped the overall score (empty when none).
+    blockers: list[str] = field(default_factory=list)
     metrics: dict[str, Any] = field(default_factory=dict)
     # Carried for page-history recording; not part of the API payload.
     html: str = field(default="", repr=False)
@@ -124,19 +129,74 @@ def _content_checks_for(group_prefixes: tuple[str, ...], content_checks: list[di
     return out
 
 
-def run_page_score(raw_url: str, *, keyword: str | None = None, device: str = "desktop",
-                   with_psi: bool = True) -> PageScoreResult:
-    """Fetch once, run every engine, and combine into one weighted 0-100.
+# A blocking problem ("fix these first" in the methodology) caps the overall
+# score however clean the rest of the page is: a noindex, broken or title-less
+# page can't rank, so it must not show a healthy number. These signals are read
+# reliably from the raw HTML, so they stay hard caps.
+_NOINDEX_CAP = 15
+_BLOCKER_CAP = 40
+# Thin content is a SOFT cap: it keeps a page out of the "Good" band but does not
+# brand it "Poor". Content depth is measured from a JS-blind HTTP fetch, so on
+# JS-rendered sites (Shopify collections/product grids, Next apps) the real body
+# lives behind JavaScript and the raw-HTML word count under-counts — using it as
+# a hard "Poor" cap mass-produces false Poor ratings. Thinness is already
+# penalised proportionally in the content category (the heaviest weight), so the
+# soft cap only prevents a thin page from reading as "Good".
+_THIN_CAP = 79
 
-    Raises the same ``audit_service`` errors (InvalidUrlError / BlockedUrlError /
-    FetchError) as the audit tool, since it is the single fetch path.
-    """
-    audit = audit_service.run_audit(raw_url, device, with_psi=with_psi)
 
-    # Reuse the already-fetched HTML — no second request.
-    facts = content_score.extract(audit.html, audit.final_url)
+def _classify(url: str) -> str:
+    """Best-effort page type from the URL (deferred import avoids a cycle)."""
+    try:
+        from app.services.page_discovery_service import classify_page_type
+
+        return classify_page_type(url)
+    except Exception:  # noqa: BLE001 — classification is best-effort
+        return "other"
+
+
+def _blockers(audit: audit_service.AuditResult, facts: dict, page_type: str,
+              word_count: int) -> tuple[list[str], int]:
+    """Blocking issues found + the score ceiling they impose (100 = no cap).
+
+    ``word_count`` is the readable main-content count (same as the editor), so a
+    JS/card page with real content isn't falsely treated as thin."""
+    reasons: list[str] = []
+    cap = 100
+    if any(c.id == "indexable" and c.status == "fail" for c in audit.checks):
+        reasons.append("Set to noindex — search engines are told not to rank it.")
+        cap = min(cap, _NOINDEX_CAP)
+    if audit.status_code != 200:
+        reasons.append(f"Returned HTTP {audit.status_code}, not 200.")
+        cap = min(cap, _BLOCKER_CAP)
+    if not (facts.get("title") or "").strip():
+        reasons.append("No title tag.")
+        cap = min(cap, _BLOCKER_CAP)
+    if not facts.get("h1"):
+        reasons.append("No H1 heading.")
+        cap = min(cap, _BLOCKER_CAP)
+    floor = content_score.depth_thresholds(page_type)[2]
+    if word_count < floor:
+        reasons.append(f"Severely thin content (~{word_count} words).")
+        cap = min(cap, _THIN_CAP)
+    return reasons, cap
+
+
+def compose(audit: audit_service.AuditResult, *, keyword: str | None = None,
+            page_type: str = "") -> PageScoreResult:
+    """Combine an already-fetched audit + content analysis into one genuine
+    0-100 on-page/technical SEO score. Pure (no network), so discovery can reuse
+    it on HTML it already fetched. Core Web Vitals and GSC are never inputs —
+    they are context only. Blocking problems cap the result."""
+    facts = content_score.extract(audit.html, audit.final_url)  # title/meta/h1/technical
     kw = " ".join((keyword or "").split())
-    content_checks, content_value = content_score.score(facts, kw)
+    ptype = (page_type or _classify(audit.final_url)).lower()
+    # Score CONTENT on the SAME readable main-content the editor uses (trafilatura),
+    # so the Discovery/Page score matches the editor and JS/card pages (Shopify,
+    # Next) with real content aren't falsely scored as thin.
+    readable = content_score.readable_html(audit.html)
+    content_facts, content_checks, content_value = content_score.score_fields(
+        facts["title"], facts["meta"], readable, audit.final_url, kw, page_type=ptype)
 
     # Normalise audit checks to a common shape and bucket them by category.
     audit_checks_flat = [
@@ -169,10 +229,13 @@ def run_page_score(raw_url: str, *, keyword: str | None = None, device: str = "d
             categories.append(ScoreCategory(cid, CATEGORY_LABELS[cid], weight, _weighted_score(checks), checks))
 
     # Overall = weighted mean of the categories that could be measured
-    # (re-normalised so a missing category never drags the score down).
+    # (re-normalised so a missing category never drags the score down)...
     scored = [c for c in categories if c.score is not None]
     wsum = sum(c.weight for c in scored)
     overall = round(sum(c.weight * c.score for c in scored) / wsum) if wsum else 0
+    # ...then capped by any blocking problem (thin judged on the readable body).
+    blockers, cap = _blockers(audit, facts, ptype, content_facts.get("word_count", 0))
+    overall = min(overall, cap)
 
     return PageScoreResult(
         url=audit.final_url,
@@ -185,11 +248,24 @@ def run_page_score(raw_url: str, *, keyword: str | None = None, device: str = "d
         categories=categories,
         audit_score=audit.score,
         content_score=content_value,
+        blockers=blockers,
         metrics=audit.metrics,
         html=audit.html,
         facts=facts,
         audit_checks=audit_checks_flat,
     )
+
+
+def run_page_score(raw_url: str, *, keyword: str | None = None, device: str = "desktop",
+                   with_psi: bool = True, page_type: str = "") -> PageScoreResult:
+    """Fetch once and combine into one genuine weighted 0-100.
+
+    Raises the same ``audit_service`` errors (InvalidUrlError / BlockedUrlError /
+    FetchError) as the audit tool, since it is the single fetch path. ``with_psi``
+    only populates the Core Web Vitals CONTEXT panel — it never changes the score.
+    """
+    audit = audit_service.run_audit(raw_url, device, with_psi=with_psi)
+    return compose(audit, keyword=keyword, page_type=page_type)
 
 
 def gsc_context(db, workspace, domain, page_url: str, days: int = 28) -> dict | None:
@@ -210,3 +286,17 @@ def gsc_context(db, workspace, domain, page_url: str, days: int = 28) -> dict | 
     if not perf.get("has_data"):
         return None
     return perf
+
+
+def cwv_context(metrics: dict | None) -> dict | None:
+    """Core Web Vitals / page-speed verdict for display as CONTEXT only — it is
+    never part of the score. Returns None when there's nothing to show."""
+    status = (metrics or {}).get("speed_status")
+    if not status:
+        return None
+    return {
+        "status": status,
+        "detail": metrics.get("speed_detail", ""),
+        "source": metrics.get("speed_source"),
+        "core_web_vitals": metrics.get("core_web_vitals"),
+    }

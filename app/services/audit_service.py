@@ -417,17 +417,19 @@ def analyze_html(
     else:
         checks.append(Check("content", "Content depth", "pass", f"~{word_count} words of content.", 1))
 
-    # Page speed: prefer real Core Web Vitals (PSI) when available, else fall
-    # back to the raw server-fetch time (rough — not a real browser).
+    # Page speed / Core Web Vitals is CONTEXT only, never folded into the SEO
+    # score: it needs real-user field data (often missing, and the fetch-time
+    # fallback isn't a real browser). Compute a verdict for display (prefer real
+    # PSI, else raw fetch time) and surface it in `metrics` — not as a check.
     psi_speed = _psi_speed_check(psi) if psi else None
     if psi_speed is not None:
-        checks.append(psi_speed)
+        speed_status, speed_detail = psi_speed.status, psi_speed.detail
     elif load_time_ms <= 1000:
-        checks.append(Check("speed", "Response time", "pass", f"Fetched in {load_time_ms} ms.", 2))
+        speed_status, speed_detail = "pass", f"Fetched in {load_time_ms} ms."
     elif load_time_ms <= 3000:
-        checks.append(Check("speed", "Response time", "warn", f"Fetched in {load_time_ms} ms — could be faster.", 2))
+        speed_status, speed_detail = "warn", f"Fetched in {load_time_ms} ms — could be faster."
     else:
-        checks.append(Check("speed", "Response time", "fail", f"Fetched in {load_time_ms} ms — slow.", 2))
+        speed_status, speed_detail = "fail", f"Fetched in {load_time_ms} ms — slow."
 
     # Page weight (HTML only)
     if page_size_bytes > 1_000_000:
@@ -490,8 +492,11 @@ def analyze_html(
         "has_favicon": has_favicon,
         "hreflang_count": hreflang_count,
         "h2_count": h2_count,
-        # Page speed: where the speed check's verdict came from, plus the real
-        # Core Web Vitals when PSI was used (None on the fetch-time fallback).
+        # Page speed is context, not a scored check. Carry the verdict + where it
+        # came from, plus the real Core Web Vitals when PSI was used (None on the
+        # fetch-time fallback), for the Speed & search panel to display.
+        "speed_status": speed_status,
+        "speed_detail": speed_detail,
         "speed_source": "psi" if psi_speed else "fetch",
         "core_web_vitals": psi if psi_speed else None,
     }

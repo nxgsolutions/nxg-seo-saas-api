@@ -86,8 +86,8 @@ def test_analyze_bad_page_flags_problems() -> None:
         page_size_bytes=len(bad.encode()),
     )
     failed = {c.id for c in result.checks if c.status == "fail"}
-    # Missing title, description, h1, viewport, not https, slow.
-    assert {"title", "description", "h1", "viewport", "https", "speed"} <= failed
+    # Missing title, description, h1, viewport, not https. (Speed is context now.)
+    assert {"title", "description", "h1", "viewport", "https"} <= failed
     assert result.score < 50
 
 
@@ -165,39 +165,48 @@ def _psi(overall=None, score=None):
     }
 
 
-def test_speed_check_uses_real_field_cwv() -> None:
+def test_speed_is_context_metric_not_a_scored_check() -> None:
+    """Core Web Vitals is shown as context in metrics, never as a scored check."""
     result = analyze_html(GOOD_HTML, "https://example.com/", 200, 9000, len(GOOD_HTML),
                           psi=_psi(overall="FAST"))
-    speed = next(c for c in result.checks if c.id == "speed")
-    # Real users say the page is fast, so it passes despite the slow fetch time.
-    assert speed.status == "pass"
-    assert "Core Web Vitals" in speed.detail and "LCP 2.1 s" in speed.detail
+    assert all(c.id != "speed" for c in result.checks)
+    # Real users say the page is fast, so the context verdict passes.
+    assert result.metrics["speed_status"] == "pass"
+    assert "Core Web Vitals" in result.metrics["speed_detail"] and "LCP 2.1 s" in result.metrics["speed_detail"]
     assert result.metrics["speed_source"] == "psi"
     assert result.metrics["core_web_vitals"]["field"]["overall"] == "FAST"
 
 
-def test_speed_check_poor_field_fails() -> None:
+def test_speed_context_poor_field() -> None:
     result = analyze_html(GOOD_HTML, "https://example.com/", 200, 100, len(GOOD_HTML),
                           psi=_psi(overall="SLOW"))
-    assert next(c for c in result.checks if c.id == "speed").status == "fail"
+    assert result.metrics["speed_status"] == "fail"
 
 
-def test_speed_check_falls_back_to_lab_score() -> None:
+def test_speed_context_falls_back_to_lab_score() -> None:
     # No field data → use the lab performance score bucket.
     result = analyze_html(GOOD_HTML, "https://example.com/", 200, 100, len(GOOD_HTML),
                           psi=_psi(score=40))
-    speed = next(c for c in result.checks if c.id == "speed")
-    assert speed.status == "fail"
-    assert "40/100" in speed.detail
+    assert result.metrics["speed_status"] == "fail"
+    assert "40/100" in result.metrics["speed_detail"]
 
 
-def test_speed_check_falls_back_to_fetch_time_without_psi() -> None:
+def test_speed_context_falls_back_to_fetch_time_without_psi() -> None:
     result = analyze_html(GOOD_HTML, "https://example.com/", 200, 5000, len(GOOD_HTML))
-    speed = next(c for c in result.checks if c.id == "speed")
-    assert speed.status == "fail"  # 5000 ms fetch
-    assert "Fetched in" in speed.detail
+    assert result.metrics["speed_status"] == "fail"  # 5000 ms fetch
+    assert "Fetched in" in result.metrics["speed_detail"]
     assert result.metrics["speed_source"] == "fetch"
     assert result.metrics["core_web_vitals"] is None
+
+
+def test_cwv_does_not_change_the_audit_score() -> None:
+    """Score invariance: PSI/CWV present vs absent yields the same audit score."""
+    base = analyze_html(GOOD_HTML, "https://example.com/", 200, 100, len(GOOD_HTML))
+    fast = analyze_html(GOOD_HTML, "https://example.com/", 200, 100, len(GOOD_HTML),
+                        psi=_psi(overall="FAST"))
+    slow = analyze_html(GOOD_HTML, "https://example.com/", 200, 100, len(GOOD_HTML),
+                        psi=_psi(overall="SLOW"))
+    assert base.score == fast.score == slow.score
 
 
 def test_image_detail_limit_is_explicit():

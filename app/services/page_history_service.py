@@ -255,8 +255,11 @@ def record(db: Session, workspace: Workspace, url: str, *, html: str | None = No
     page.title = facts["title"][:512] or page.title
     page.last_checked_at = now
     page.snapshot_count = (page.snapshot_count or 0) + 1
-    if audit_score is not None:
-        page.latest_audit_score = audit_score
+    # The Discovery column shows the genuine overall SEO score when it was
+    # computed; a pure technical audit (no overall) falls back to its own score.
+    col_score = overall_score if overall_score is not None else audit_score
+    if col_score is not None:
+        page.latest_audit_score = col_score
     if changes:
         page.last_changed_at = now
     if page.domain_id is None:

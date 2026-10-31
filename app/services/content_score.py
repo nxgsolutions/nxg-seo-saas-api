@@ -256,8 +256,32 @@ def article_html(html: str) -> str:
     return re.sub(r"\n{3,}", "\n\n", inner).strip()
 
 
+def readable_html(html: str) -> str:
+    """Clean, main-content HTML via trafilatura — the SAME extraction the content
+    editor edits and scores. Works on JS-light / card-based pages (Shopify, Next)
+    that have no <article>/<main> wrapper, where the simple DOM extractor above
+    under-counts. Falls back to article_html when trafilatura finds nothing.
+
+    Pure parsing (no network), so the page score and the editor score the exact
+    same body — they can't diverge."""
+    try:
+        import trafilatura
+
+        out = trafilatura.extract(
+            html or "", output_format="html", include_formatting=True,
+            include_links=True, include_tables=True, favor_precision=False)
+    except Exception:  # noqa: BLE001 — extraction must never break scoring
+        out = None
+    if not out:
+        return article_html(html)
+    soup = BeautifulSoup(out, "html.parser")
+    body = soup.body or soup
+    inner = body.decode_contents() if hasattr(body, "decode_contents") else str(body)
+    return inner.strip() or article_html(html)
+
+
 def score_fields(title: str, meta: str, body_html: str, url: str,
-                 keyword: str = "") -> tuple[dict, list[dict], int]:
+                 keyword: str = "", page_type: str = "") -> tuple[dict, list[dict], int]:
     """Score edited editor fields: wrap them as a minimal page, then reuse the
     same extract + score path the live analyzer uses. Returns (facts, checks, 0-100)."""
     from html import escape
@@ -267,7 +291,7 @@ def score_fields(title: str, meta: str, body_html: str, url: str,
         f"<body><article>{body_html or ''}</article></body></html>"
     )
     facts = extract(html, url or "https://example.com/")
-    checks, sc = score(facts, keyword or "")
+    checks, sc = score(facts, keyword or "", page_type=page_type)
     return facts, checks, sc
 
 
@@ -354,9 +378,35 @@ def _band(v: float | None, good: tuple[float, float], ok: tuple[float, float]) -
     return "warn" if ok[0] <= v <= ok[1] else "fail"
 
 
+# Content-depth thresholds by page type: (pass_at, warn_at, floor).
+# A page below `warn_at` fails the depth check; below `floor` it is "severely
+# thin" — a blocker the overall page score caps on (see page_score_service).
+# Transactional pages (product/category/tag) legitimately carry less prose than
+# an informational blog/guide, so their bars are lower — intent-aware, per the
+# on-page SEO methodology.
+DEPTH_THRESHOLDS: dict[str, tuple[int, int, int]] = {
+    "blog": (700, 300, 150),
+    "content": (600, 300, 150),
+    "home": (300, 120, 60),
+    "category": (250, 100, 50),
+    "tag": (180, 80, 40),
+    "product": (250, 120, 60),
+    "other": (400, 150, 80),
+}
+_DEFAULT_DEPTH = DEPTH_THRESHOLDS["other"]
+
+
+def depth_thresholds(page_type: str) -> tuple[int, int, int]:
+    return DEPTH_THRESHOLDS.get((page_type or "").lower(), _DEFAULT_DEPTH)
+
+
 def score(facts: dict, keyword: str = "", bench: dict | None = None,
-          terms: list[dict] | None = None) -> tuple[list[dict], int]:
-    """The checklist (pass / warn / fail, weighted) and the 0-100 score."""
+          terms: list[dict] | None = None, page_type: str = "") -> tuple[list[dict], int]:
+    """The checklist (pass / warn / fail, weighted) and the 0-100 score.
+
+    ``page_type`` tunes the content-depth bar (a product page needs less prose
+    than a blog) so the score reflects intent, not a one-size word count.
+    """
     kw = " ".join((keyword or "").split())
     c: list[dict] = []
     KP, TM, ST, CD, ML = "Keyword placement", "Title & meta", "Structure", "Content depth", "Media & links"
@@ -418,9 +468,10 @@ def score(facts: dict, keyword: str = "", bench: dict | None = None,
                         f"{wc:,} words · top pages ≈ {round(target):,}",
                         f"Expand toward ~{round(target * 0.8):,}+ words by covering missing subtopics."))
     else:
-        st = "pass" if wc >= 800 else "warn" if wc >= 300 else "fail"
+        pass_at, warn_at, _floor = depth_thresholds(page_type)
+        st = "pass" if wc >= pass_at else "warn" if wc >= warn_at else "fail"
         c.append(_check("words", CD, "Content length", st, 10, f"{wc:,} words",
-                        "Aim for 800+ words of useful content."))
+                        f"Aim for {pass_at:,}+ words of useful content for this kind of page."))
     re_ = facts["reading_ease"]
     c.append(_check("readability", CD, "Readability", "warn" if re_ is None else _band(re_, (50, 100), (30, 100)), 6,
                     f"Reading ease {re_}" if re_ is not None else "Too little text to measure",

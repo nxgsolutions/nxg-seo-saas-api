@@ -66,3 +66,22 @@ def test_site_technical_no_pages_fails_coverage() -> None:
     _, out = dss.site_technical_score([], {"total": 0, "indexable": 0}, https_ok=True)
     coverage = next(c for c in out if c["id"] == "coverage")
     assert coverage["status"] == "fail"
+
+
+def test_thin_domain_scores_low_rich_domain_scores_high() -> None:
+    """With the genuine (stricter) per-page scores, a thin-page domain must land
+    low and a rich-page domain high — the ordering the lenient scores missed."""
+    thin = dss.aggregate([_page(30, "content") for _ in range(5)])
+    rich = dss.aggregate([_page(85, "content") for _ in range(5)])
+    assert thin["page_quality"] < 40
+    assert rich["page_quality"] >= 80
+    assert rich["page_quality"] > thin["page_quality"]
+    assert thin["weak_share"] == 1.0  # every page below the weak threshold
+
+
+def test_aggregate_handles_category_dict_without_performance() -> None:
+    """Category averages work with the performance-less category dict (no KeyError)."""
+    out = dss.aggregate([_page(70, "home", {"content": 70, "technical": 80})])
+    assert out["scored"] == 1
+    assert "performance" not in out["category_averages"]
+    assert out["category_averages"]["content"] == 70

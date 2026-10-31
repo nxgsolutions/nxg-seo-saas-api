@@ -322,9 +322,14 @@ def run_page_audit(
     record = page_audit_service.save_audit(db, ctx.workspace, current_user, result)
     # Page history: timestamped snapshot + what changed since the last check.
     checks = [{"id": c.id, "label": c.label, "status": c.status} for c in result.checks]
+    # Compose the genuine overall SEO score from this audit (no extra fetch) so
+    # the Discovery column stays consistent with the Page Score tool.
+    ps = page_score_service.compose(result)
     page_history_service.safe_record(
         db, ctx.workspace, result.final_url, html=result.html, source="audit", source_id=record.id,
-        device=payload.device, audit_score=result.score, checks=checks,
+        device=payload.device, audit_score=result.score,
+        content_score_value=ps.content_score, overall_score=ps.overall,
+        category_scores={c.id: c.score for c in ps.categories}, checks=checks,
         tech=page_history_service.audit_tech(result.status_code, result.load_time_ms, result.page_size_bytes,
                                              result.metrics, checks),
     )

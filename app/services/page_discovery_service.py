@@ -262,6 +262,7 @@ def _enrich_one(entry: dict) -> dict:
         return out
     out["url"] = final_url
     out["status"] = response.status_code
+    out["score"] = None
     ctype = (response.headers.get("content-type", "") or "").lower()
     if response.status_code != 200 or "html" not in ctype:
         out["indexable"] = False
@@ -271,8 +272,28 @@ def _enrich_one(entry: dict) -> dict:
     out["title"] = (soup.title.get_text(" ", strip=True) if soup.title else "")[:512]
     out["page_type"] = classify_page_type(final_url, soup)
     out["indexable"] = _is_indexable(response, soup)
-    out["word_count"] = _main_content_word_count(raw.decode("utf-8", "ignore"))
+    html_text = raw.decode("utf-8", "ignore")
+    out["word_count"] = _main_content_word_count(html_text)
+    # Genuine on-page/technical SEO score from the HTML we already fetched — no
+    # extra request, and no PageSpeed/GSC calls (those are context, not score).
+    out["score"] = _score_html(html_text, final_url, response.status_code, len(raw), out["page_type"])
     return out
+
+
+def _score_html(html: str, final_url: str, status_code: int, size: int, page_type: str) -> int | None:
+    """Compose the genuine page score from already-fetched HTML (pure, no I/O).
+    Deferred import keeps page_discovery/page_score free of an import cycle."""
+    try:
+        from app.services import page_score_service
+
+        audit = audit_service.analyze_html(
+            html=html, final_url=final_url, status_code=status_code,
+            load_time_ms=0, page_size_bytes=size, psi=None,
+        )
+        audit.html = html  # analyze_html leaves it unset; compose re-reads it
+        return page_score_service.compose(audit, page_type=page_type).overall
+    except Exception:  # noqa: BLE001 — scoring must never break enrichment
+        return None
 
 
 def enrich_batch(entries: list[dict]) -> list[dict]:
@@ -322,6 +343,8 @@ def _apply_enrichment(db, workspace: Workspace, results: list[dict]) -> None:
         page.indexable = r.get("indexable")
         page.page_type = r.get("page_type")
         page.word_count = r.get("word_count")
+        if r.get("score") is not None:
+            page.latest_audit_score = r["score"]
         if r.get("url") and r["url"] != page.url:
             page.url = r["url"]
         if r.get("title"):
@@ -577,23 +600,9 @@ CONTENT_HTML_CAP = 200_000  # keep cached/editor HTML bounded
 
 
 def _readable_html(html: str) -> str:
-    """Clean, editable main-content HTML via trafilatura (headings, paragraphs,
-    lists, tables and links kept; nav/footer/cards stripped). Works on JS-light
-    server-rendered apps like Next.js where there's no <article>/<main> wrapper —
-    our simple extractor would return raw card markup there. Falls back to that
-    simple extractor only if trafilatura finds nothing."""
-    try:
-        out = trafilatura.extract(
-            html, output_format="html", include_formatting=True,
-            include_links=True, include_tables=True, favor_precision=False)
-    except Exception:  # noqa: BLE001 — extraction must never break the request
-        out = None
-    if not out:
-        return content_score.article_html(html)
-    soup = BeautifulSoup(out, "html.parser")
-    body = soup.body or soup
-    inner = body.decode_contents() if hasattr(body, "decode_contents") else str(body)
-    return inner.strip() or content_score.article_html(html)
+    """Clean, editable main-content HTML. Shared with the page scorer
+    (content_score.readable_html) so the editor and the score read the same body."""
+    return content_score.readable_html(html)
 
 
 def get_page(db, domain: Domain, page_id: str) -> SitePage | None:
@@ -653,7 +662,8 @@ def score_page_content(db, domain: Domain, page_id: str, *, title: str, meta: st
     page = get_page(db, domain, page_id)
     if page is None:
         return None
-    facts, checks, sc = content_score.score_fields(title, meta, body_html, page.url, keyword)
+    facts, checks, sc = content_score.score_fields(
+        title, meta, body_html, page.url, keyword, page_type=page.page_type or "")
     return {
         "score": sc, "checks": checks, "word_count": facts["word_count"],
         "reading_ease": facts["reading_ease"], "internal_links": facts["internal_links"],
