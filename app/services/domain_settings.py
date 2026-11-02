@@ -48,10 +48,29 @@ def split_terms(raw: str | None) -> list[str]:
 
 
 def compile_topic_regex(terms: list[str]) -> str | None:
-    """OR-regex of the terms (each escaped), or None when the list is empty."""
+    """OR-regex of the terms, or None when the list is empty.
+
+    Each term is included, PLUS the individual words of any multi-word term, so a
+    niche recorded as "lakshmi ganesh idol" also treats "ganesh" and "idol" as
+    on-topic — otherwise a keyword like "pagdi ganesh murti" is wrongly dropped
+    just because the stored term happened to be a phrase. Component words shorter
+    than 3 characters are skipped so tiny fragments can't match broadly. Keywords
+    that share no topic word (e.g. "cricket live score" for an exam site) are
+    still excluded."""
     if not terms:
         return None
-    return "|".join(re.escape(t) for t in terms)
+    parts: list[str] = []
+    seen: set[str] = set()
+    for t in terms:
+        for piece in (t, *t.split()):
+            piece = piece.strip()
+            if not piece or piece in seen:
+                continue
+            if piece != t and len(piece) < 3:   # keep the full term; skip tiny fragments
+                continue
+            seen.add(piece)
+            parts.append(piece)
+    return "|".join(re.escape(p) for p in parts)
 
 
 def _fallback(*values: str | None) -> str:

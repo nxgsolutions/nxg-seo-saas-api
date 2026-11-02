@@ -46,6 +46,20 @@ class CompetitorCreate(BaseModel):
     label: str | None = Field(None, max_length=255)
 
 
+class CompetitorBulkAddItem(BaseModel):
+    domain: str = Field(..., min_length=3, max_length=255)
+    label: str | None = Field(None, max_length=255)
+    reason: str | None = Field(None, max_length=600)
+    confidence: str | None = Field(None, max_length=20)
+    match_score: int | None = Field(None, ge=0, le=100)
+
+
+class CompetitorBulkAddRequest(BaseModel):
+    """Add several competitors at once — used when the user confirms the newly
+    found competitors from a "find competitors again" preview."""
+    competitors: list[CompetitorBulkAddItem] = Field(..., max_length=50)
+
+
 class CompetitorDiscoverRequest(BaseModel):
     # Domain to analyze; defaults to the path domain when omitted.
     target_domain: str | None = Field(None, max_length=255)
@@ -56,6 +70,22 @@ class CompetitorDiscoverRequest(BaseModel):
     # Re-scrape and re-extract the business profile instead of reusing the cached
     # one. Default False = reuse the stored profile (fast, no re-extraction).
     refresh: bool = False
+    # Preview mode: discover candidates WITHOUT changing the tracked list, so the
+    # user can confirm which newly found competitors to merge in. Default False =
+    # first-run discovery that seeds the list directly (nothing to overwrite).
+    preview: bool = False
+
+
+class ProposedCompetitor(BaseModel):
+    """A candidate from a preview ("find competitors again") run, shown to the
+    user for confirmation before it is merged into the tracked list."""
+    domain: str
+    name: str | None = None
+    reason: str | None = None
+    confidence: str | None = None
+    match_score: int | None = None
+    # True when this candidate is already on the user's list (shown greyed out).
+    already_tracked: bool = False
 
 
 class DiscoveryJobOut(BaseModel):
@@ -67,6 +97,8 @@ class DiscoveryJobOut(BaseModel):
     total_steps: int
     count: int | None = None         # competitors found (when done)
     error: str | None = None
+    # Preview runs only: the candidates to confirm before merging (null otherwise).
+    proposed: list[ProposedCompetitor] | None = None
 
 
 class BusinessProfile(BaseModel):

@@ -60,6 +60,16 @@ class GscApiError(Exception):
     """A Google API call failed."""
 
 
+class GscTokenRevokedError(GscApiError):
+    """The stored refresh token was expired or revoked by Google (invalid_grant).
+
+    The user must reconnect to grant a fresh token. Common causes: the OAuth
+    consent screen is still in "Testing" (Google expires test-app refresh tokens
+    after 7 days), the user revoked access, 6 months of inactivity, or a Google
+    password change. Subclasses GscApiError so existing handlers still catch it.
+    """
+
+
 # --- OAuth state (signed, short-lived) --------------------------------------
 def sign_state(workspace_id: str, user_id: str, return_path: str) -> str:
     """Sign a short-lived state token binding the callback to a workspace/user."""
@@ -167,7 +177,15 @@ def _refresh(conn: GscConnection) -> TokenBundle:
     except httpx.HTTPError as exc:
         raise GscApiError(f"Token refresh failed: {exc}") from exc
     if resp.status_code != 200:
-        raise GscApiError(f"Token refresh failed ({resp.status_code}): {resp.text[:200]}")
+        text = resp.text[:200]
+        # invalid_grant = Google permanently rejected the refresh token; no retry
+        # will help, so surface a clean "reconnect" message instead of raw JSON.
+        if "invalid_grant" in text:
+            raise GscTokenRevokedError(
+                "Your Google Search Console connection expired or was revoked. "
+                "Reconnect to restore your live ranking data."
+            )
+        raise GscApiError(f"Token refresh failed ({resp.status_code}): {text}")
     body = resp.json()
     return TokenBundle(
         access_token=body["access_token"],

@@ -17,6 +17,7 @@ from app.api.errors import upstream_error
 from app.db.session import get_db
 from app.schemas.competitor import (
     BusinessProfileResponse,
+    CompetitorBulkAddRequest,
     CompetitorCreate,
     CompetitorDiscoverRequest,
     CompetitorDiscoverResponse,
@@ -27,6 +28,7 @@ from app.schemas.competitor import (
     CuratedCompetitor,
     CuratedCompetitorsResponse,
     DiscoveryJobOut,
+    ProposedCompetitor,
 )
 from app.services import competitor_service
 from app.services.competitor_service import CompetitorError
@@ -76,6 +78,25 @@ def add_curated(
     return CuratedCompetitor(**row)
 
 
+@router.post(
+    "/competitors/list/bulk",
+    response_model=CuratedCompetitorsResponse,
+    summary="Add several competitors at once (confirm a 'find again' preview)",
+    responses={404: {"description": "Domain not found"}},
+)
+def add_curated_bulk(
+    payload: CompetitorBulkAddRequest,
+    ctx: DomainContext = Depends(get_domain_context),
+    db: Session = Depends(get_db),
+) -> CuratedCompetitorsResponse:
+    result = competitor_service.add_competitors_bulk(
+        db, ctx.domain, [c.model_dump() for c in payload.competitors]
+    )
+    return CuratedCompetitorsResponse(
+        domain=result["domain"], count=result["count"], rows=result["rows"]
+    )
+
+
 @router.delete(
     "/competitors/list/{competitor_id}",
     status_code=status.HTTP_204_NO_CONTENT,
@@ -94,10 +115,14 @@ def delete_curated(
 
 
 def _job_out(job) -> DiscoveryJobOut:
+    proposed = None
+    raw = (job.result or {}).get("proposed") if job.result else None
+    if raw is not None:
+        proposed = [ProposedCompetitor(**p) for p in raw]
     return DiscoveryJobOut(
         job_id=str(job.id), status=job.status, step=job.step,
         step_label=job.step_label, total_steps=job.total_steps,
-        count=job.count, error=job.error,
+        count=job.count, error=job.error, proposed=proposed,
     )
 
 
@@ -128,6 +153,7 @@ def discover(
         ctx.workspace.id, ctx.domain.id, job.id,
         target_domain=payload.target_domain, limit=payload.limit,
         extra_services=payload.extra_services, refresh=payload.refresh,
+        preview=payload.preview,
     )
     return _job_out(job)
 

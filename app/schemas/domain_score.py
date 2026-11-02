@@ -16,6 +16,7 @@ class DomainScoreJobOut(BaseModel):
     step_label: str | None = None
     pages_total: int | None = None
     pages_scored: int
+    pages_failed: int = 0
     error: str | None = None
     result_id: uuid.UUID | None = None
     started_at: datetime
@@ -68,3 +69,22 @@ class DomainScoreView(BaseModel):
     latest: DomainScoreOut | None = None
     history: list[DomainScoreTrendPoint] = []
     running: DomainScoreJobOut | None = None
+    # Whether a fresh whole-site score may be run now, and when the next one
+    # becomes available (last run + the weekly refresh window).
+    can_refetch: bool = True
+    next_refetch_at: datetime | None = None
+
+
+class StoredPageScore(BaseModel):
+    """The latest saved score for one page, for an instant (no-fetch) open."""
+
+    url: str
+    page_id: str | None = None
+    overall: int | None = None
+    audit_score: int | None = None
+    content_score: int | None = None
+    category_scores: dict[str, int] = {}
+    checks: list[dict[str, Any]] = []
+    device: str | None = None
+    source: str
+    captured_at: datetime

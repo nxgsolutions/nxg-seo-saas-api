@@ -60,6 +60,30 @@ class Settings(BaseSettings):
     # heavily rate-limited without one). Get one at https://developers.google.com/speed/docs/insights/v5/get-started
     PSI_API_KEY: str = ""
 
+    # ── Whole-site scoring ────────────────────────────────────────────────
+    # The whole-site score audits every indexable page (reusing recent page
+    # scores). These bound the work and keep fetching polite so the server's IP
+    # isn't rate-limited/blocked by the target site's firewall.
+    # Hard ceiling on pages scored in one run (protects the server and the
+    # target site from a runaway job on a very large site).
+    DOMAIN_SCORE_MAX_PAGES: int = 2000
+    # How often a whole-site score may be refreshed (the one-time + weekly gate).
+    # Set to 0 to allow an instant re-run at any time (handy for testing).
+    DOMAIN_SCORE_REFRESH_DAYS: int = 7
+    # Reuse a page's stored score if captured within this many days (no re-fetch).
+    # A re-run skips pages already scored this window, so re-runs stay fast and an
+    # interrupted run resumes cheaply. Kept separate from the refresh gate so the
+    # gate can be lowered for testing without forcing a slow full re-fetch.
+    DOMAIN_SCORE_FRESH_DAYS: int = 7
+    # Polite gap between LIVE page fetches (seconds, randomised in this range).
+    # Reused stored scores do no fetch and are not delayed. Raise if the target
+    # site still blocks the crawl.
+    DOMAIN_SCORE_FETCH_DELAY_MIN_S: float = 5.0
+    DOMAIN_SCORE_FETCH_DELAY_MAX_S: float = 10.0
+    # Extra cooldown added before the next fetch after a page comes back blocked
+    # (HTTP 401/403/429/503), to let a rate-limit window clear.
+    DOMAIN_SCORE_BLOCK_COOLDOWN_S: float = 30.0
+
     # Google Search Console OAuth (optional). When client id/secret are unset,
     # the GSC features stay dormant and the UI shows a "connect" prompt.
     # Create an OAuth 2.0 Client (type: Web application) in Google Cloud Console

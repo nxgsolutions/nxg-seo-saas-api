@@ -81,8 +81,25 @@ def _latest_snapshot(db: Session, domain: Domain, host: str):
     ).scalars().first()
 
 
+# Confidence labels ranked high → low for display ordering (case-insensitive).
+_CONFIDENCE_RANK = {"very high": 4, "high": 3, "medium": 2, "low": 1}
+
+
+def _match_sort_key(row: dict) -> tuple:
+    """Order the list by match quality (best first): confidence tier, then the
+    numeric match score, then SERP overlap. Rows without a signal (e.g. manual
+    adds with no confidence/score) sort last. Negated so a plain ascending sort
+    puts the strongest match first; Python's stable sort keeps insertion order
+    (created_at) for exact ties."""
+    conf = (row.get("confidence") or "").strip().lower()
+    score = row["match_score"] if row["match_score"] is not None else -1
+    shared = row["keywords_shared"] if row["keywords_shared"] is not None else -1
+    return (-_CONFIDENCE_RANK.get(conf, 0), -score, -shared)
+
+
 def list_competitors(db: Session, domain: Domain) -> dict:
-    """The curated (editable) competitor list, each with its latest SERP standing."""
+    """The curated (editable) competitor list, each with its latest SERP standing,
+    ordered by match quality (strongest match first)."""
     rows = []
     for tc in _curated(db, domain):
         snap = _latest_snapshot(db, domain, tc.competitor)
@@ -99,6 +116,7 @@ def list_competitors(db: Session, domain: Domain) -> dict:
             "keywords_shared": snap.keywords_shared if snap else None,
             "last_captured_on": snap.captured_on if snap else None,
         })
+    rows.sort(key=_match_sort_key)
     return {"domain": domain.domain, "count": len(rows), "rows": rows}
 
 
@@ -126,6 +144,10 @@ def add_competitor(
         db.add(existing)
         db.commit()
         db.refresh(existing)
+        # Best-effort: verify the newly added competitor against the cached
+        # business profile so it shows a match confidence like the discovered
+        # ones (instead of a bare "added by you"). Never blocks the add.
+        _verify_manual_add(db, domain, existing)
 
     snap = _latest_snapshot(db, domain, host)
     return {
@@ -141,6 +163,31 @@ def add_competitor(
         "keywords_shared": snap.keywords_shared if snap else None,
         "last_captured_on": snap.captured_on if snap else None,
     }
+
+
+def _verify_manual_add(db: Session, domain: Domain, tc: TrackedCompetitor) -> None:
+    """Score a manually added competitor against the domain's cached business
+    profile and store its match_score / confidence, so the UI shows a match badge
+    like the discovered competitors. Best-effort: any failure (no profile, site
+    unreachable, LLM off) leaves the entry unscored and never raises."""
+    biz = domain.business_profile
+    if not biz:
+        return
+    try:
+        from app.services import competitor_discovery_service as disc
+
+        res = disc.verify_single(biz, tc.competitor, tc.label)
+        if not res:
+            return
+        tc.match_score = res.get("match_score")
+        tc.confidence = res.get("confidence_level") or None
+        if res.get("reason"):
+            tc.reason = res["reason"]
+        db.add(tc)
+        db.commit()
+        db.refresh(tc)
+    except Exception:  # noqa: BLE001 - verification is a bonus, never blocks the add
+        db.rollback()
 
 
 def remove_competitor(db: Session, domain: Domain, competitor_id: str) -> bool:
@@ -341,14 +388,41 @@ def refresh(
 # ── LLM competitor discovery (by domain) ────────────────────────────────────
 
 
+def add_competitors_bulk(db: Session, domain: Domain, items: list[dict]) -> dict:
+    """Add several competitors at once, keeping everything already on the list
+    (used when the user confirms the newly found competitors from a preview).
+    Idempotent: domains already tracked are skipped, not duplicated."""
+    existing = set(_curated_hosts(db, domain))
+    own = keyword_analysis_service._norm_host(domain.domain)
+    added = 0
+    for item in items:
+        host = keyword_analysis_service._norm_host(item.get("domain") or "")
+        if not host or "." not in host or host == own or host in existing:
+            continue
+        db.add(TrackedCompetitor(
+            domain_id=domain.id,
+            competitor=host,
+            label=(item.get("label") or None),
+            source="ai",
+            reason=(item.get("reason") or None),
+            confidence=(item.get("confidence") or None),
+            match_score=item.get("match_score"),
+        ))
+        existing.add(host)
+        added += 1
+    db.commit()
+    return {"added": added, **list_competitors(db, domain)}
+
+
 def discover_and_store(
     db: Session, domain: Domain, *, target_domain: str | None = None,
     limit: int = 10, extra_services: list[str] | None = None,
-    refresh: bool = False, progress=None,
+    refresh: bool = False, preview: bool = False, progress=None,
 ) -> dict:
     """Run the LLM competitor finder for `target_domain` (defaults to the domain
-    itself), replace the auto/AI-sourced curated entries with the results (keeping
-    the user's manual ones), then snapshot ranks for any with SERP data.
+    itself). In the default mode it replaces the auto/AI-sourced curated entries
+    with the results (keeping the user's manual ones); in `preview` mode it changes
+    nothing and returns the candidates for the user to confirm and merge instead.
     `extra_services` steers the match toward features not yet on the site.
 
     The competitor market follows the domain's CONFIGURED country (domain →
@@ -396,12 +470,20 @@ def discover_and_store(
         if d
     ]
 
+    # Exclude the sibling domains, and in PREVIEW mode ("find competitors again")
+    # also the ones already on the user's list — so discovery never re-proposes a
+    # tracked competitor and the whole `limit` budget is spent finding genuinely
+    # NEW ones. (First-run discovery replaces the list, so nothing to exclude.)
+    exclude_domains = list(sibling_domains)
+    if preview:
+        exclude_domains.extend(_curated_hosts(db, domain))
+
     # Three agents: 1) profile this business, 2) propose candidates (+ SERP),
     # 3) profile each candidate's real site and keep the best `limit` matches.
     result = disc.discover(
         target, limit=limit, extra_services=extra_services,
         business=cached, market=market, extra_candidates=extra_candidates,
-        exclude_domains=sibling_domains, progress=progress,
+        exclude_domains=exclude_domains, progress=progress,
     )
     comps = result["competitors"]
 
@@ -410,6 +492,38 @@ def discover_and_store(
         domain.business_profile = result["business"]
         domain.business_profile_at = datetime.now(timezone.utc)
         db.add(domain)
+
+    # Preview mode: don't touch the tracked list. Return the candidates (flagged
+    # with whether each is already tracked) so the user can confirm which NEW ones
+    # to merge in. Only the refreshed business profile is committed here.
+    if preview:
+        existing_hosts = set(_curated_hosts(db, domain))
+        proposed: list[dict] = []
+        seen: set[str] = set()
+        for c in comps:
+            host = keyword_analysis_service._norm_host(c["domain"])
+            if not host or "." not in host or host in seen:
+                continue
+            seen.add(host)
+            proposed.append({
+                "domain": host,
+                "name": c.get("name") or None,
+                "reason": c.get("reason") or None,
+                "confidence": c.get("confidence_level") or None,
+                "match_score": c.get("match_score"),
+                "already_tracked": host in existing_hosts,
+            })
+        db.commit()
+        new_count = sum(1 for p in proposed if not p["already_tracked"])
+        return {
+            "domain": domain.domain,
+            "target": target,
+            "market": market,
+            "count": new_count,
+            "profile": result.get("business") or None,
+            "proposed": proposed,
+            "competitors": list_competitors(db, domain)["rows"],
+        }
 
     # Replace previous auto/ai entries; keep manual ones the user curated.
     for tc in db.execute(
@@ -485,7 +599,7 @@ def active_discovery_job(db: Session, domain: Domain) -> CompetitorDiscoveryJob 
 def run_discovery_job(
     workspace_id, domain_id, job_id, *, target_domain: str | None = None,
     limit: int = 10, extra_services: list[str] | None = None, refresh: bool = False,
-    session_factory=None,
+    preview: bool = False, session_factory=None,
 ) -> None:
     """Background worker: runs the 3-agent discovery, updating the job row's step
     as it goes, and stores the result. Own DB session; never raises (the user's
@@ -506,12 +620,17 @@ def run_discovery_job(
 
         result = discover_and_store(
             db, domain, target_domain=target_domain, limit=limit,
-            extra_services=extra_services, refresh=refresh, progress=_cb,
+            extra_services=extra_services, refresh=refresh, preview=preview,
+            progress=_cb,
         )
         job.status = "done"
         job.step = job.total_steps
         job.step_label = "Done"
         job.count = int(result.get("count") or 0)
+        # Preview runs park their candidates on the job so the UI can read them
+        # when polling sees status='done', then ask the user to confirm the merge.
+        if preview:
+            job.result = {"proposed": result.get("proposed") or []}
         job.finished_at = datetime.now(timezone.utc)
         db.add(job)
         db.commit()

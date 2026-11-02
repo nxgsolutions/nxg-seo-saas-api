@@ -66,12 +66,25 @@ def _ease(kd: int | float | None) -> float:
     return 0.5 if kd is None else max(0.05, 1 - float(kd) / 100)
 
 
+# Stable machine key per origin, so the UI can show a plain-language label and
+# filter without ever parsing the internal `source` string (which names the
+# vendor). Keep both: `source` for back-compat, `source_key` for the client.
+_SOURCE_KEYS = {
+    "Search Console": "gsc",
+    "Your rankings (DataForSEO)": "own_rank",
+    "Competitor rankings (DataForSEO)": "competitor_rank",
+    "Google results for your tracked keywords": "serp_gap",
+    "Keyword research": "research",
+}
+
+
 def _item(**kw) -> dict:
     base = {"type": None, "keyword": None, "volume": None, "difficulty": None, "position": None,
             "url": None, "competitor": None, "competitor_position": None, "competitor_url": None,
             "competitors_count": None, "gain": 0, "action": None, "reason": None, "source": None,
-            "tracked": False}
+            "source_key": None, "tracked": False}
     base.update(kw)
+    base["source_key"] = _SOURCE_KEYS.get(base.get("source") or "")
     return base
 
 
@@ -279,12 +292,25 @@ def build(db: Session, domain: Domain, *,
 
     with_data = [c for c in competitors if ranked_keywords_service.latest_run(
         db, c, location_code=loc, language=language, env=env) is not None]
+
+    # Per-origin breakdown over the whole plan, so the UI can label its source
+    # filter chips with counts. `saved` = keywords the user manually tracks.
+    all_items = improve_l + gaps_l + targets_l
+    source_counts: dict[str, int] = {}
+    for i in all_items:
+        sk = i.get("source_key")
+        if sk:
+            source_counts[sk] = source_counts.get(sk, 0) + 1
+    saved_count = sum(1 for i in all_items if i.get("tracked"))
+
     return {
         "domain": domain.domain,
         "environment": env,
         "generated_at": datetime.now(timezone.utc),
         "target_position": TARGET_POSITION,
         "counts": {"improve": len(improve), "gaps": len(gaps), "targets": len(targets)},
+        "source_counts": source_counts,
+        "saved_count": saved_count,
         # Headline excludes very hard head terms (KD >= 70) — unrealistic in the short run.
         "total_gain": sum(i["gain"] for i in top if (i["difficulty"] or 0) < HARD_KD),
         "hard_kd": HARD_KD,

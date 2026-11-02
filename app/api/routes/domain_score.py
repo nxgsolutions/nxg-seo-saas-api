@@ -21,15 +21,25 @@ router = APIRouter(
 @router.post("", response_model=DomainScoreJobOut, summary="Score this whole site")
 def start_score(
     background_tasks: BackgroundTasks,
+    force: bool = False,
     ctx: DomainContext = Depends(get_domain_context),
     db: Session = Depends(get_db),
 ) -> DomainScoreJobOut:
-    """Start a background whole-site score: samples the domain's discovered pages
-    (reusing recent page scores), adds site-wide technical signals, and stores one
-    0-100. Poll GET /status; a run already in flight is returned as-is."""
+    """Start a background whole-site score: audits every indexable page (reusing
+    recent page scores), adds site-wide technical signals, and stores one 0-100.
+    Poll GET /status; a run already in flight is returned as-is. The score is a
+    one-time run refreshed weekly — a fresh run is refused while the last score
+    is still within the refresh window unless ``force`` is set."""
     running = domain_score_service.running_job(db, ctx.domain)
     if running is not None:
         return DomainScoreJobOut.model_validate(running)
+
+    # One-time + weekly refetch: don't recompute a still-fresh score unless forced.
+    latest = domain_score_service.latest_score(db, ctx.domain)
+    if not force and not domain_score_service.can_refetch(latest):
+        last_job = domain_score_service.latest_job(db, ctx.domain)
+        if last_job is not None:
+            return DomainScoreJobOut.model_validate(last_job)
 
     domain_score_service.supersede_stale(db, ctx.domain)
     job = DomainScoreJob(workspace_id=ctx.workspace.id, domain_id=ctx.domain.id, status="running")
@@ -62,4 +72,6 @@ def get_score(
         latest=latest,
         history=list(reversed(hist)),  # oldest → newest for the trend line
         running=running,
+        can_refetch=domain_score_service.can_refetch(latest),
+        next_refetch_at=domain_score_service.next_refetch_at(latest),
     )

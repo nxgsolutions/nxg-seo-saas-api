@@ -1,16 +1,24 @@
 """Whole-site (domain) SEO score.
 
-Aggregates a capped, representative sample of a domain's per-page overall scores
-(reused from page_snapshots when fresh, otherwise freshly scored) and blends
-them with site-wide technical signals (robots/sitemap/HTTPS/indexable coverage)
-into one 0-100. The heavy work runs in a background job (run_domain_score); the
-combining logic (aggregate / site_technical_score) is pure and unit-tested.
+Aggregates a domain's per-page overall scores (reused from page_snapshots when
+fresh, otherwise freshly scored) and blends them with site-wide technical
+signals (robots/sitemap/HTTPS/indexable coverage) into one 0-100. Every
+indexable page is scored (bounded by a safety ceiling). The heavy work runs in a
+background job (run_domain_score); the combining logic (aggregate /
+site_technical_score) is pure and unit-tested.
 
     domain_overall = round(PAGE_W * page_quality_adjusted + SITE_W * site_technical)
+
+Fetching is throttled (a randomised gap between live page fetches, with a longer
+cooldown after a block) so the server's IP isn't rate-limited by the target
+site. A reused stored score does no fetch and is not delayed, so a re-run after
+an interruption resumes cheaply (already-scored pages are skipped).
 """
 
 from __future__ import annotations
 
+import random
+import time
 import uuid
 from datetime import datetime, timedelta, timezone
 from urllib.parse import urlparse
@@ -18,6 +26,7 @@ from urllib.parse import urlparse
 from sqlalchemy import or_, select, update
 from sqlalchemy.orm import Session
 
+from app.core.config import settings
 from app.db.session import SessionLocal
 from app.models.domain import Domain
 from app.models.domain_score import DomainScore, DomainScoreJob
@@ -27,13 +36,23 @@ from app.services import crawl_service, page_discovery_service, page_history_ser
 from app.services.audit_service import BlockedUrlError, FetchError, InvalidUrlError
 from app.services.page_score_service import CATEGORY_WEIGHTS
 
-# Tunables.
-DOMAIN_SCORE_MAX_PAGES = 25     # sample cap per run
-FRESH_DAYS = 14                 # reuse a page's stored score if newer than this
+# Tunables (settings-backed; see app/core/config.py).
+DOMAIN_SCORE_MAX_PAGES = settings.DOMAIN_SCORE_MAX_PAGES  # safety ceiling per run
+REFRESH_DAYS = settings.DOMAIN_SCORE_REFRESH_DAYS         # weekly refetch gate (0 = run anytime)
+FRESH_DAYS = settings.DOMAIN_SCORE_FRESH_DAYS             # reuse a stored score within this window
 PAGE_W = 0.70                   # weight of aggregated page quality in the domain score
 SITE_W = 0.30                   # weight of site-wide technical signals
 WEAK_THRESHOLD = 50             # a page scoring below this is "weak"
 WEAK_PENALTY = 0.30             # max downward pull when every page is weak
+
+# A legitimately long throttled run can take a while; a 'running' row is only
+# considered dead if its heartbeat (last_progress_at) hasn't moved in this long.
+HEARTBEAT_STALE = timedelta(minutes=20)
+
+# HTTP statuses that mean a firewall/bot-protection blocked us (mirrors
+# audit_service._BLOCK_STATUS). A blocked page is counted as failed, not scored,
+# and triggers a cooldown before the next fetch.
+_BLOCK_STATUS = (401, 403, 429, 503)
 
 # Page importance when averaging (evergreen, high-value pages count for more).
 TYPE_WEIGHT = {"home": 3.0, "content": 2.0, "blog": 2.0, "category": 1.5, "tag": 1.0, "other": 1.0}
@@ -50,12 +69,13 @@ def _ptype(p: SitePage) -> str:
     return p.page_type or "other"
 
 
-# ── Sampling ──────────────────────────────────────────────────────────────
+# ── Page selection ───────────────────────────────────────────────────────────
 
-def select_sample(db: Session, domain: Domain, cap: int = DOMAIN_SCORE_MAX_PAGES) -> list[SitePage]:
-    """A representative sample of the domain's discovered pages: the home page,
-    then the rest spread across page types (so one big section can't dominate),
-    capped at ``cap``. Only crawlable, non-noindex pages are eligible."""
+def select_pages(db: Session, domain: Domain, cap: int = DOMAIN_SCORE_MAX_PAGES) -> list[SitePage]:
+    """Every indexable, fetchable discovered page, home page first and then the
+    rest spread across page types (so partial progress stays representative and
+    one big section is scored first-in-class). Bounded by ``cap`` as a safety
+    ceiling. Only crawlable, non-noindex, 200 pages are eligible."""
     rows = db.execute(
         select(SitePage).where(
             SitePage.domain_id == domain.id,
@@ -81,12 +101,12 @@ def select_sample(db: Session, domain: Domain, cap: int = DOMAIN_SCORE_MAX_PAGES
         g.sort(key=lambda p: p.url)
     order = sorted(groups, key=lambda t: TYPE_WEIGHT.get(t, 1.0), reverse=True)
 
-    sample: list[SitePage] = home[:1]
-    while len(sample) < cap and any(groups[t] for t in order):
+    selected: list[SitePage] = home[:1]
+    while len(selected) < cap and any(groups[t] for t in order):
         for t in order:
-            if groups[t] and len(sample) < cap:
-                sample.append(groups[t].pop(0))
-    return sample[:cap]
+            if groups[t] and len(selected) < cap:
+                selected.append(groups[t].pop(0))
+    return selected[:cap]
 
 
 # ── Aggregation (pure) ──────────────────────────────────────────────────────
@@ -119,7 +139,7 @@ def site_technical_score(crawl_checks: list, summary: dict, https_ok: bool) -> t
     """Weighted 0-100 for site-wide technical health + the checks for display.
 
     ``crawl_checks``: crawl_service.Check list (robots/sitemap). ``summary``:
-    page_discovery_service.summary(). ``https_ok``: every sampled page was HTTPS.
+    page_discovery_service.summary(). ``https_ok``: every scored page was HTTPS.
     """
     checks: list[dict] = [
         {"id": c.id, "label": c.label, "status": c.status, "detail": c.detail}
@@ -127,7 +147,7 @@ def site_technical_score(crawl_checks: list, summary: dict, https_ok: bool) -> t
     ]
 
     checks.append({"id": "https", "label": "HTTPS", "status": "pass" if https_ok else "fail",
-                   "detail": "All sampled pages are served over HTTPS." if https_ok
+                   "detail": "All scored pages are served over HTTPS." if https_ok
                    else "Some pages are not served over HTTPS."})
 
     total = summary.get("total") or 0
@@ -146,11 +166,11 @@ def site_technical_score(crawl_checks: list, summary: dict, https_ok: bool) -> t
     return (round(100 * got / wsum) if wsum else 0), checks
 
 
-# ── Scoring one page (reuse-or-run) ─────────────────────────────────────────
+# ── Scoring one page (reuse / fetch) ─────────────────────────────────────────
 
-def _score_one(db: Session, workspace: Workspace, page: SitePage, fresh_before: datetime) -> dict | None:
-    """One page's result, reusing a recent stored score or computing a new one.
-    Returns None when the page can't be fetched/scored."""
+def _reuse_score(db: Session, page: SitePage, fresh_before: datetime) -> dict | None:
+    """A recent stored score for this page, or None if none is fresh enough.
+    Reuse does no network request, so it is not throttled."""
     snap = db.execute(
         select(PageSnapshot).where(
             PageSnapshot.page_id == page.id,
@@ -158,14 +178,24 @@ def _score_one(db: Session, workspace: Workspace, page: SitePage, fresh_before: 
             PageSnapshot.captured_at >= fresh_before,
         ).order_by(PageSnapshot.captured_at.desc()).limit(1)
     ).scalar_one_or_none()
-    if snap is not None:
-        return {"url": page.url, "page_id": str(page.id), "score": snap.overall_score,
-                "page_type": _ptype(page), "categories": snap.category_scores or {}, "fetched": False}
-
-    try:
-        result = page_score_service.run_page_score(page.url)
-    except (InvalidUrlError, BlockedUrlError, FetchError):
+    if snap is None:
         return None
+    return {"url": page.url, "page_id": str(page.id), "score": snap.overall_score,
+            "page_type": _ptype(page), "categories": snap.category_scores or {}}
+
+
+def _fetch_score(db: Session, workspace: Workspace, page: SitePage) -> dict:
+    """Fetch and score one page live, snapshotting it. Returns the page result,
+    or {"failed": True, "blocked": bool} when it couldn't be read. Core Web
+    Vitals (PSI) is skipped here — it's context only and too slow/heavy in bulk."""
+    try:
+        result = page_score_service.run_page_score(page.url, with_psi=False)
+    except (InvalidUrlError, BlockedUrlError, FetchError):
+        return {"failed": True, "blocked": False}
+    # A block page isn't the real page — don't score or snapshot it (so it isn't
+    # reused and skipped next time); count it as failed and let the caller cool down.
+    if result.status_code in _BLOCK_STATUS:
+        return {"failed": True, "blocked": True}
 
     checks = [{"id": c["id"], "label": c["label"], "status": c["status"]} for c in result.audit_checks]
     cats = {c.id: c.score for c in result.categories}
@@ -180,7 +210,7 @@ def _score_one(db: Session, workspace: Workspace, page: SitePage, fresh_before: 
     except Exception:  # noqa: BLE001 — history is a side effect, never fail the score
         db.rollback()
     return {"url": result.final_url, "page_id": str(page.id), "score": result.overall,
-            "page_type": _ptype(page), "categories": cats, "fetched": True}
+            "page_type": _ptype(page), "categories": cats}
 
 
 # ── Background worker ───────────────────────────────────────────────────────
@@ -194,8 +224,10 @@ def _finish_error(db: Session, job: DomainScoreJob, message: str) -> None:
 
 def run_domain_score(workspace_id, domain_id, job_id, *, session_factory=None) -> None:
     """Score a whole site into one DomainScore. Own DB session; never raises
-    (background worker — the request has already returned). Updates the job's
-    progress as it goes so the UI can poll."""
+    (background worker — the request has already returned). Throttles live
+    fetches, updates the job's progress + heartbeat as it goes (so the UI can
+    poll and a long run reads as alive), and resumes cheaply on a re-run because
+    pages scored within the refresh window are reused without a fetch."""
     db = (session_factory or SessionLocal)()
     job = None
     try:
@@ -206,25 +238,50 @@ def run_domain_score(workspace_id, domain_id, job_id, *, session_factory=None) -
             return
 
         job.step, job.step_label = 1, "Finding pages"
+        job.last_progress_at = datetime.now(timezone.utc)
         db.commit()
-        sample = select_sample(db, domain)
-        if not sample:
+        pages = select_pages(db, domain)
+        if not pages:
             _finish_error(db, job, "No pages found for this site yet. Run Page Discovery first.")
             return
-        job.pages_total = len(sample)
+        total = len(pages)
+        job.pages_total = total
         db.commit()
 
         fresh_before = datetime.now(timezone.utc) - timedelta(days=FRESH_DAYS)
         results: list[dict] = []
-        for i, page in enumerate(sample, 1):
-            job.step, job.step_label = 2, f"Scoring pages ({i}/{len(sample)})"
-            r = _score_one(db, workspace, page, fresh_before)
-            if r is not None:
-                results.append(r)
+        failed = 0
+        cooldown = 0.0
+        for i, page in enumerate(pages, 1):
+            reuse = _reuse_score(db, page, fresh_before)
+            if reuse is not None:
+                results.append(reuse)
+            else:
+                # Be polite: wait a randomised gap (plus any block cooldown) before
+                # a live fetch, so the target site doesn't rate-limit our IP.
+                time.sleep(random.uniform(settings.DOMAIN_SCORE_FETCH_DELAY_MIN_S,
+                                          settings.DOMAIN_SCORE_FETCH_DELAY_MAX_S) + cooldown)
+                cooldown = 0.0
+                r = _fetch_score(db, workspace, page)
+                if r.get("failed"):
+                    failed += 1
+                    if r.get("blocked"):
+                        cooldown = settings.DOMAIN_SCORE_BLOCK_COOLDOWN_S
+                else:
+                    results.append(r)
+
+            job.step, job.step_label = 2, f"Scoring pages ({i}/{total})"
             job.pages_scored = len(results)
+            job.pages_failed = failed
+            job.last_progress_at = datetime.now(timezone.utc)
             db.commit()
+            # Stop if a newer run superseded this one (status flipped off 'running').
+            db.refresh(job)
+            if job.status != "running":
+                return
 
         job.step, job.step_label = 3, "Checking site-wide signals"
+        job.last_progress_at = datetime.now(timezone.utc)
         db.commit()
         origin = "https://" + domain.domain.strip().lower().removeprefix("www.").rstrip("/")
         try:
@@ -252,7 +309,7 @@ def run_domain_score(workspace_id, domain_id, job_id, *, session_factory=None) -
         db.flush()
         job.result_id = score.id
         job.status, job.step, job.step_label = "done", 3, "Done"
-        job.finished_at = datetime.now(timezone.utc)
+        job.last_progress_at = job.finished_at = datetime.now(timezone.utc)
         db.commit()
     except Exception as exc:  # noqa: BLE001
         db.rollback()
@@ -275,12 +332,16 @@ def latest_job(db: Session, domain: Domain) -> DomainScoreJob | None:
 
 
 def running_job(db: Session, domain: Domain) -> DomainScoreJob | None:
-    """An in-flight job (started < 15 min ago); older 'running' rows are stale."""
+    """An in-flight job: status 'running' AND its heartbeat is recent. A crashed
+    worker leaves a 'running' row with a stale heartbeat — treated as dead."""
     job = latest_job(db, domain)
-    if job is None or job.status != "running" or job.started_at is None:
+    if job is None or job.status != "running":
         return None
-    started = job.started_at if job.started_at.tzinfo else job.started_at.replace(tzinfo=timezone.utc)
-    return job if datetime.now(timezone.utc) - started < timedelta(minutes=15) else None
+    beat = job.last_progress_at or job.started_at
+    if beat is None:
+        return None
+    beat = beat if beat.tzinfo else beat.replace(tzinfo=timezone.utc)
+    return job if datetime.now(timezone.utc) - beat < HEARTBEAT_STALE else None
 
 
 def supersede_stale(db: Session, domain: Domain) -> None:
@@ -296,6 +357,20 @@ def latest_score(db: Session, domain: Domain) -> DomainScore | None:
         select(DomainScore).where(DomainScore.domain_id == domain.id)
         .order_by(DomainScore.created_at.desc()).limit(1)
     ).scalar_one_or_none()
+
+
+def next_refetch_at(score: DomainScore | None) -> datetime | None:
+    """When a fresh whole-site score may next be run (last run + refresh window)."""
+    if score is None or score.created_at is None:
+        return None
+    created = score.created_at if score.created_at.tzinfo else score.created_at.replace(tzinfo=timezone.utc)
+    return created + timedelta(days=REFRESH_DAYS)
+
+
+def can_refetch(score: DomainScore | None) -> bool:
+    """True when there's no score yet, or the last one is older than the window."""
+    nxt = next_refetch_at(score)
+    return nxt is None or datetime.now(timezone.utc) >= nxt
 
 
 def history(db: Session, domain: Domain, limit: int = 30) -> list[DomainScore]:

@@ -507,35 +507,94 @@ def _add_source_once(db: Session, keyword: Keyword, source_type: str, reference:
         )
 
 
-# Generic app/social/nav words that pollute keyword seeds (they come from a site's
-# footer/download links, not its topic) — a phrase containing any is dropped.
+# Words that pollute topic seeds — they come from a site's chrome (footer/download
+# links), its shop UI, or promo/price copy, not from its actual niche. A seed
+# word that is one of these, or a phrase containing one, is dropped.
 _SEED_STOPWORDS = {
+    # app / social / nav chrome
     "app", "apps", "download", "downloads", "telegram", "whatsapp", "facebook",
     "instagram", "youtube", "twitter", "gmail", "google", "play", "store",
     "playstore", "appstore", "login", "signin", "signup", "register", "subscribe",
     "home", "page", "click", "menu", "share", "follow", "email", "contact", "chat",
+    "about", "faq", "faqs", "blog", "account", "search", "help", "support",
+    # shop UI / checkout
+    "shop", "shopping", "buy", "cart", "add", "wishlist", "checkout", "order",
+    "orders", "quantity", "qty", "view", "more", "product", "products", "category",
+    "categories", "collection", "collections", "item", "items", "shipping",
+    "delivery", "returns", "return", "track", "payment",
+    # promo / price / commerce adjectives (dominate e-commerce homepages, say
+    # nothing about the niche)
+    "best", "seller", "sellers", "sale", "sales", "off", "deal", "deals", "offer",
+    "offers", "discount", "discounts", "free", "price", "prices", "pricing", "save",
+    "new", "latest", "trending", "popular", "featured", "exclusive", "luxury",
+    "premium", "quality", "authentic", "original", "genuine", "top", "online",
+    "rs", "inr", "usd", "rupees", "amount", "total", "review", "reviews", "rating",
+    "ratings", "star", "stars", "india", "indian",
+    # generic filler nouns
+    "piece", "pieces", "every", "day", "days", "set", "sets", "size", "sizes",
+    "color", "colour", "gift", "gifts", "range", "world", "time", "way",
+    # TLD / URL fragments that survive tokenisation
+    "com", "www", "net", "org", "co", "https", "http",
 }
 
 
+def _meaningful_seed_word(w: str) -> bool:
+    """A content word worth keeping as a topic seed: alphabetic, not too short,
+    and not a chrome/shop/promo stopword (so digits, prices and 'best seller'
+    never become a topic)."""
+    return len(w) >= 3 and w.isalpha() and w not in _SEED_STOPWORDS
+
+
+def topic_seeds_from_ngrams(
+    unigrams: list[dict], bigrams: list[dict], trigrams: list[dict], *, brand: str = "",
+) -> list[str]:
+    """Pure topic-seed selection from a page's ranked n-grams (no I/O — so it's
+    unit-testable and shared by the crawl path below).
+
+    Prefers salient single nouns (what the site actually sells / covers —
+    'brass', 'diya', 'statue'), then adds clean multi-word phrases for precision.
+    Chrome, shop-UI, promo/price words, anything with a digit, and the site's own
+    brand token are all dropped, so 'best seller sale' / '999 00' / the brand
+    name never become a topic."""
+    brand = (brand or "").lower()
+
+    def ok(w: str) -> bool:
+        if not _meaningful_seed_word(w):
+            return False
+        # Drop the brand token itself (e.g. "peetalkraft") and words built from it.
+        return not (brand and (w == brand or brand in w or w in brand))
+
+    seeds: list[str] = []
+    # 1) Salient single nouns — the core topic signal, and what competitor-gap
+    #    keywords actually match against.
+    for p in (unigrams or [])[:20]:
+        w = str(p.get("phrase", "")).strip().lower()
+        if ok(w):
+            seeds.append(w)
+    # 2) Clean multi-word phrases (every word meaningful, no digits) for extra
+    #    precision on multi-word concepts.
+    for p in (trigrams or [])[:8] + (bigrams or [])[:10]:
+        text = str(p.get("phrase", "")).strip().lower()
+        words = text.split()
+        if words and all(ok(w) for w in words):
+            seeds.append(text)
+    return list(dict.fromkeys(seeds))[:15]
+
+
 def _site_topic_seeds(website_input: str) -> list[str]:
-    """Crawl the site's homepage and return its top TOPICAL phrases — the reliable
+    """Crawl the site's homepage and return its top TOPICAL terms — the reliable
     signal of what the site is about (Google's site/url seed guesses wrong for
-    lesser-known domains). Uses multi-word phrases only and filters generic app/nav
-    words, so footer 'download app / telegram' links don't leak in. Best-effort."""
+    lesser-known domains). Best-effort; the selection itself lives in the pure
+    topic_seeds_from_ngrams so it can be tested without a crawl."""
     url = website_input if website_input.lower().startswith("http") else f"https://{website_input}"
     try:
         analysis = content_service.run_analysis(url)
     except Exception:  # noqa: BLE001 — any crawl/parse failure just skips this path
         return []
-    phrases: list[str] = []
-    # Bigrams + trigrams only (single words are too broad and pull in junk).
-    for p in analysis.trigrams[:6] + analysis.bigrams[:8]:
-        text = str(p.get("phrase", "")).strip().lower()
-        words = text.split()
-        if not text or any(w in _SEED_STOPWORDS for w in words):
-            continue
-        phrases.append(text)
-    return list(dict.fromkeys(phrases))[:12]
+    # The site's own brand token (host without TLD) is not a topic.
+    brand = _norm_host(website_input).split(".")[0]
+    return topic_seeds_from_ngrams(
+        analysis.unigrams, analysis.bigrams, analysis.trigrams, brand=brand)
 
 
 def _domain_payload(research: KeywordResearch, rows: list[dict], *, cached: bool) -> dict:

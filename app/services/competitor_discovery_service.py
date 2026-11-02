@@ -645,6 +645,59 @@ def extract_business_profile(target_domain: str) -> dict:
     return _extract_business(corpus, target_domain)
 
 
+def confidence_for_score(score: int | None) -> str:
+    """Map a 0-100 match score to the same confidence labels the discovery model
+    emits, so a verified manual add reads like the AI-found ones."""
+    if score is None:
+        return ""
+    if score >= 85:
+        return "Very High"
+    if score >= 70:
+        return "High"
+    if score >= 50:
+        return "Medium"
+    return "Low"
+
+
+def verify_single(business: dict, domain: str, name: str | None = None) -> dict | None:
+    """Score ONE competitor (e.g. a manual add) against the cached business
+    profile, reusing the discovery verification step. Returns
+    {"match_score", "confidence_level", "reason"} — best-effort, one homepage
+    scrape + at most one LLM call. Returns None when there's no profile to match
+    against; never raises (callers fall back to an unscored entry)."""
+    if not business:
+        return None
+    host = _norm_domain(domain)
+    if not host:
+        return None
+    try:
+        live, snippet = _check_site(host)
+    except Exception:  # noqa: BLE001 - scraping is best-effort
+        live, snippet = False, ""
+    candidate = {
+        "domain": host, "name": (name or host),
+        "match_score": None, "reason": "", "confidence_level": "",
+    }
+    if live and snippet:
+        candidate["_snippet"] = snippet
+    try:
+        verified = _verify_competitors(business, [candidate])
+    except Exception:  # noqa: BLE001 - verification unavailable
+        verified = [candidate]
+    # The user deliberately added this domain, so even if verification flags it
+    # off-category (dropped from the discovery list) we still keep it — as a low
+    # match rather than discarding it.
+    if not verified:
+        return {"match_score": None, "confidence_level": "Low", "reason": ""}
+    v = verified[0]
+    score = _parse_score(v.get("match_score"))
+    return {
+        "match_score": score,
+        "confidence_level": confidence_for_score(score),
+        "reason": (v.get("reason") or "").strip() or None,
+    }
+
+
 def discover(
     target_domain: str, *, limit: int = 10, extra_services: list[str] | None = None,
     business: dict | None = None, market: str | None = None,

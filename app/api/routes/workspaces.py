@@ -23,6 +23,7 @@ from app.schemas.page_score import (
     PageScoreResponse,
     PerformanceContext,
 )
+from app.schemas.domain_score import StoredPageScore
 from app.schemas.domain import DomainCreate, DomainResponse, DomainUpdate
 from app.schemas.workspace import (
     WorkspaceCreate,
@@ -458,6 +459,30 @@ def run_page_score(
 
     return PageScoreResponse.from_result(
         result, performance_context=perf_ctx, page_id=page_id, changes=changes, captured_at=captured_at,
+    )
+
+
+@router.get(
+    "/{workspace_id}/page-scores/latest",
+    response_model=StoredPageScore | None,
+    summary="Latest saved score for a page (no fetch)",
+    responses={404: {"description": "Workspace not found"}},
+)
+def latest_page_score(
+    url: str,
+    ctx: WorkspaceContext = Depends(get_workspace_context),
+    db: Session = Depends(get_db),
+) -> StoredPageScore | None:
+    """Return the page's most recent saved score so it opens instantly, without
+    re-fetching. Null when the page has never been scored."""
+    snap = page_history_service.latest_score_snapshot(db, ctx.workspace, url)
+    if snap is None:
+        return None
+    return StoredPageScore(
+        url=url, page_id=str(snap.page_id), overall=snap.overall_score,
+        audit_score=snap.audit_score, content_score=snap.content_score,
+        category_scores=snap.category_scores or {}, checks=snap.checks or [],
+        device=snap.device, source=snap.source, captured_at=snap.captured_at,
     )
 
 

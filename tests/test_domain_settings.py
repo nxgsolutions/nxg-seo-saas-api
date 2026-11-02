@@ -32,6 +32,18 @@ def test_compile_topic_regex_matches_terms_and_escapes():
     assert re.search(rx, "learn c++ fast", re.I)             # special chars escaped
 
 
+def test_compile_topic_regex_matches_component_words_of_phrases():
+    # A phrase term also makes its individual words on-topic, so a store whose
+    # niche is "lakshmi ganesh idol" still matches "ganesh" / "idol" keywords...
+    rx = ds.compile_topic_regex(["lakshmi ganesh idol", "antique brass"])
+    assert re.search(rx, "pagdi ganesh murti", re.I)         # via "ganesh"
+    assert re.search(rx, "krishna idol for home", re.I)      # via "idol"
+    assert re.search(rx, "brass diya set", re.I)             # via "brass"
+    # ...but a keyword sharing no topic word stays off-topic.
+    assert not re.search(rx, "cricket live score", re.I)
+    assert not re.search(rx, "water heater price", re.I)
+
+
 def test_fallback_chain_country_language():
     # domain value wins
     s = ds.resolve(_dom(country="US", language="de"), _ws(default_country="gb", default_language="fr"))

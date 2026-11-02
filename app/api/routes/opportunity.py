@@ -298,13 +298,22 @@ _ACTION_SORTS = {"gain", "volume", "difficulty", "position", "competitor_positio
 @router.get("/action-plan/items", response_model=ActionItemsResponse,
             summary="One page of an action-plan list (improve | gap | target) — DB only")
 def action_plan_items(type: str = Query(..., pattern="^(improve|gap|target)$"),
+                      source: str | None = Query(
+                          None, pattern="^(gsc|own_rank|competitor_rank|serp_gap|research)$",
+                          description="Filter to one origin (source_key)"),
+                      saved: bool = Query(False, description="Only keywords the user manually tracks"),
                       country: str = _COUNTRY,
                       listing: PageQuery = Depends(page_query),
                       ctx: DomainContext = Depends(get_domain_context),
                       db: Session = Depends(get_db)) -> ActionItemsResponse:
     """Default order = the plan's priority; `sort` = gain | volume | difficulty |
-    position | competitor_position | keyword. `q` matches keyword, competitor or URL."""
+    position | competitor_position | keyword. `q` matches keyword, competitor or URL.
+    `source` keeps one origin; `saved=true` keeps manually-tracked keywords only."""
     items = action_plan_service.build(db, ctx.domain, country=country)[_ACTION_LISTS[type]]
+    if source:
+        items = [i for i in items if i.get("source_key") == source]
+    if saved:
+        items = [i for i in items if i.get("tracked")]
     term = listing.search()
     if term:
         items = [i for i in items if term in i["keyword"].lower() or term in (i.get("competitor") or "")

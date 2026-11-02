@@ -352,6 +352,7 @@ class ActionItem(BaseModel):
     action: str | None = None
     reason: str | None = None
     source: str | None = None
+    source_key: str | None = None          # gsc | own_rank | competitor_rank | serp_gap | research
     tracked: bool = False
 
 
@@ -368,6 +369,8 @@ class ActionPlanResponse(BaseModel):
     generated_at: datetime
     target_position: int
     counts: dict[str, int]
+    source_counts: dict[str, int] = {}     # how many keywords per origin (source_key -> n)
+    saved_count: int = 0                   # keywords the user manually tracks
     total_gain: int                        # of the top actions, excluding KD >= hard_kd
     hard_kd: int = 70
     sources: ActionPlanSources

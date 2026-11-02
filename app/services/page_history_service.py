@@ -487,6 +487,20 @@ def backfill_from_audits(db: Session) -> int:
     return n
 
 
+def latest_score_snapshot(db: Session, workspace: Workspace, url: str) -> PageSnapshot | None:
+    """The most recent snapshot that carries an overall score for this URL, for
+    showing a page's saved score without re-fetching. None if never scored."""
+    key = url_key(url)
+    page = db.execute(select(SitePage).where(SitePage.workspace_id == workspace.id, SitePage.url_key == key)
+                      ).scalar_one_or_none()
+    if page is None:
+        return None
+    return db.execute(
+        select(PageSnapshot).where(PageSnapshot.page_id == page.id, PageSnapshot.overall_score.isnot(None))
+        .order_by(PageSnapshot.captured_at.desc()).limit(1)
+    ).scalar_one_or_none()
+
+
 def for_run(db: Session, workspace: Workspace, source_id: uuid.UUID) -> tuple[uuid.UUID | None, list[dict]]:
     """(page id, changes) recorded for a tool run (e.g. an audit), if any."""
     snap = db.execute(select(PageSnapshot).where(PageSnapshot.workspace_id == workspace.id,

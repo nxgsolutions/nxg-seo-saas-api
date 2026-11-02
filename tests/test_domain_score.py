@@ -1,6 +1,10 @@
 """Tests for the domain (whole-site) score aggregation — pure logic, no DB."""
 
+from datetime import datetime, timedelta, timezone
+from types import SimpleNamespace
+
 from app.services import domain_score_service as dss
+from app.services.audit_service import FetchError
 from app.services.crawl_service import Check
 
 
@@ -85,3 +89,42 @@ def test_aggregate_handles_category_dict_without_performance() -> None:
     assert out["scored"] == 1
     assert "performance" not in out["category_averages"]
     assert out["category_averages"]["content"] == 70
+
+
+# ── Weekly refetch gating (pure, given a stored score object) ────────────────
+
+def test_can_refetch_when_no_score_yet() -> None:
+    assert dss.next_refetch_at(None) is None
+    assert dss.can_refetch(None) is True
+
+
+def test_refetch_blocked_until_window_then_allowed() -> None:
+    old = SimpleNamespace(created_at=datetime.now(timezone.utc) - timedelta(days=dss.REFRESH_DAYS + 1))
+    assert dss.can_refetch(old) is True             # past the window → always refetchable
+    if dss.REFRESH_DAYS > 0:
+        fresh = SimpleNamespace(created_at=datetime.now(timezone.utc))
+        assert dss.can_refetch(fresh) is False      # still within the refresh window
+        assert dss.next_refetch_at(fresh) > datetime.now(timezone.utc)
+    else:
+        # Gate disabled (e.g. lowered for testing): a run is allowed at any time.
+        fresh = SimpleNamespace(created_at=datetime.now(timezone.utc))
+        assert dss.can_refetch(fresh) is True
+
+
+# ── Block handling (monkeypatched fetch, no DB/network) ──────────────────────
+
+def test_fetch_score_treats_block_as_failed(monkeypatch) -> None:
+    """A page returning a firewall block (503) is failed+blocked, never scored,
+    so it isn't snapshotted and reused (which would stop us ever retrying it)."""
+    monkeypatch.setattr(dss.page_score_service, "run_page_score",
+                        lambda url, **kw: SimpleNamespace(status_code=503))
+    out = dss._fetch_score(None, None, SimpleNamespace(url="https://x.test/"))
+    assert out == {"failed": True, "blocked": True}
+
+
+def test_fetch_score_fetch_error_failed_not_blocked(monkeypatch) -> None:
+    def boom(url, **kw):
+        raise FetchError("nope")
+    monkeypatch.setattr(dss.page_score_service, "run_page_score", boom)
+    out = dss._fetch_score(None, None, SimpleNamespace(url="https://x.test/"))
+    assert out == {"failed": True, "blocked": False}

@@ -31,12 +31,15 @@ class DomainScoreJob(Base):
     status: Mapped[str] = mapped_column(String(16), nullable=False, server_default=text("'running'"))  # running|done|error
     step: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("0"))
     step_label: Mapped[str | None] = mapped_column(String(120), nullable=True)
-    pages_total: Mapped[int | None] = mapped_column(Integer, nullable=True)   # sample size chosen
+    pages_total: Mapped[int | None] = mapped_column(Integer, nullable=True)   # pages chosen to score
     pages_scored: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("0"))
+    pages_failed: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("0"))  # blocked/errored
     error: Mapped[str | None] = mapped_column(String(300), nullable=True)
     # The score id produced on success (so the UI can fetch the result directly).
     result_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
     started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    # Heartbeat: bumped after every page so a long throttled run reads as alive.
+    last_progress_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
 
