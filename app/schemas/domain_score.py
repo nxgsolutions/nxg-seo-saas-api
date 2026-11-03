@@ -69,7 +69,7 @@ class DomainScoreView(BaseModel):
     latest: DomainScoreOut | None = None
     history: list[DomainScoreTrendPoint] = []
     running: DomainScoreJobOut | None = None
-    # Whether a fresh whole-site score may be run now, and when the next one
+    # Whether a fresh SEO Score may be run now, and when the next one
     # becomes available (last run + the weekly refresh window).
     can_refetch: bool = True
     next_refetch_at: datetime | None = None

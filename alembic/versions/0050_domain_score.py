@@ -1,4 +1,4 @@
-"""domain score — whole-site score job + stored scores
+"""domain score — SEO Score job + stored scores
 
 A domain score aggregates a capped sample of a domain's per-page overall scores
 plus site-wide technical signals into one 0-100. domain_score_jobs backs the

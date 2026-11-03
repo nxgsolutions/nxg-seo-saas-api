@@ -360,7 +360,7 @@ def latest_score(db: Session, domain: Domain) -> DomainScore | None:
 
 
 def next_refetch_at(score: DomainScore | None) -> datetime | None:
-    """When a fresh whole-site score may next be run (last run + refresh window)."""
+    """When a fresh SEO Score may next be run (last run + refresh window)."""
     if score is None or score.created_at is None:
         return None
     created = score.created_at if score.created_at.tzinfo else score.created_at.replace(tzinfo=timezone.utc)

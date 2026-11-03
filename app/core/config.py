@@ -61,13 +61,13 @@ class Settings(BaseSettings):
     PSI_API_KEY: str = ""
 
     # ── Whole-site scoring ────────────────────────────────────────────────
-    # The whole-site score audits every indexable page (reusing recent page
+    # The SEO Score audits every indexable page (reusing recent page
     # scores). These bound the work and keep fetching polite so the server's IP
     # isn't rate-limited/blocked by the target site's firewall.
     # Hard ceiling on pages scored in one run (protects the server and the
     # target site from a runaway job on a very large site).
     DOMAIN_SCORE_MAX_PAGES: int = 2000
-    # How often a whole-site score may be refreshed (the one-time + weekly gate).
+    # How often a SEO Score may be refreshed (the one-time + weekly gate).
     # Set to 0 to allow an instant re-run at any time (handy for testing).
     DOMAIN_SCORE_REFRESH_DAYS: int = 7
     # Reuse a page's stored score if captured within this many days (no re-fetch).

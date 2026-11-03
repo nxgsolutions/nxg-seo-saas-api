@@ -44,7 +44,7 @@ class DomainScoreJob(Base):
 
 
 class DomainScore(Base):
-    """One computed whole-site score for a domain (kept for history/trend)."""
+    """One computed SEO Score for a domain (kept for history/trend)."""
 
     __tablename__ = "domain_scores"
 

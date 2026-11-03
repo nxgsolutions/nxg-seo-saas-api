@@ -1,6 +1,6 @@
 """domain score progress — full-site coverage, failures + heartbeat
 
-The whole-site score now audits every indexable page (not a 25-page sample),
+The SEO Score now audits every indexable page (not a 25-page sample),
 throttled to stay polite. A long run needs two extra fields on the job row so
 the UI can show real progress and the server can tell a live run from a dead one:
 

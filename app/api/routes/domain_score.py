@@ -25,7 +25,7 @@ def start_score(
     ctx: DomainContext = Depends(get_domain_context),
     db: Session = Depends(get_db),
 ) -> DomainScoreJobOut:
-    """Start a background whole-site score: audits every indexable page (reusing
+    """Start a background SEO Score: audits every indexable page (reusing
     recent page scores), adds site-wide technical signals, and stores one 0-100.
     Poll GET /status; a run already in flight is returned as-is. The score is a
     one-time run refreshed weekly — a fresh run is refused while the last score
@@ -60,7 +60,7 @@ def status(
     return DomainScoreJobOut.model_validate(job) if job is not None else None
 
 
-@router.get("", response_model=DomainScoreView, summary="Latest whole-site score + trend")
+@router.get("", response_model=DomainScoreView, summary="Latest SEO Score + trend")
 def get_score(
     ctx: DomainContext = Depends(get_domain_context),
     db: Session = Depends(get_db),
