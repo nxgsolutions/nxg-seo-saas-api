@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import json
 import logging
+import random
 import re
 import time
 from collections import deque
@@ -25,7 +26,6 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from urllib.parse import urljoin, urlparse
 
-import trafilatura
 from bs4 import BeautifulSoup
 from sqlalchemy import case, func, select, update
 
@@ -44,7 +44,22 @@ SITEMAP_DEPTH = 3          # how deep a sitemap-index tree is followed
 MAX_SITEMAPS = 50          # total sitemap documents fetched per scan
 CRAWL_DEPTH = 3            # link-following depth for the no-sitemap fallback
 CRAWL_TIME_BUDGET_S = 25.0
-ENRICH_WORKERS = 6
+# All pages in a scan share one host, so the worker count IS the load we put on
+# that host. A big parallel burst trips bot-protection / rate limits (503/429),
+# so we fetch gently (few workers + per-request jitter) — the same one-at-a-time
+# cadence that lets Content Optimization read these pages. Reliability over speed.
+ENRICH_WORKERS = 3
+ENRICH_JITTER_S = (0.15, 0.6)  # random pre-fetch delay per page, to spread the burst
+# Adaptive early-stop. Some sites rate-limit by *cumulative* requests per IP:
+# the first ~dozens succeed, then the whole IP gets clamped and every remaining
+# page 503s. Hammering through (or retrying a hot IP) only entrenches the block,
+# so instead we watch the block rate in a sliding window and PAUSE the run when a
+# site starts clamping — keeping what we read and leaving the rest for a later
+# run, once the IP has cooled. A polite site that never blocks still finishes in
+# one pass. Pages are enriched gap-first (never-fetched, then blocked, then thin)
+# so each run makes real progress toward full coverage instead of redoing page 1.
+ENRICH_WINDOW = 20        # pages per commit + block-rate check
+BLOCK_STOP_RATE = 0.5     # pause the run when a full window is >= this fraction blocked
 
 SITEMAP_CANDIDATES = ("sitemap.xml", "sitemap_index.xml", "sitemap-index.xml", "wp-sitemap.xml")
 _ASSET_RE = re.compile(r"\.(?:jpe?g|png|gif|webp|svg|ico|css|js|pdf|zip|gz|mp4|mp3|woff2?|ttf|xml)(?:\?|$)", re.I)
@@ -237,43 +252,48 @@ def _is_indexable(response, soup: BeautifulSoup) -> bool:
     return True
 
 
-def _main_content_word_count(html: str) -> int | None:
-    """Clean main-content word count via trafilatura (nav/footer/ads stripped).
-    Runs locally — no network, no cost. None when nothing meaningful was found."""
-    if not html:
-        return None
-    try:
-        text = trafilatura.extract(html, include_comments=False, include_tables=False, favor_precision=True)
-    except Exception:  # noqa: BLE001 — extraction must never break enrichment
-        return None
-    return len(text.split()) if text else None
-
-
-def _enrich_one(entry: dict) -> dict:
+def _enrich_one(entry: dict, *, jitter: bool = True) -> dict:
     """Fetch one discovered URL and read status / title / type / indexability /
     word count. `loc` is the original (stored) URL used to match the row; `url`
-    is the final URL after redirects."""
+    is the final URL after redirects.
+
+    `blocked` marks a bot-protection block (401/403/429/503) — distinct from a
+    page that is genuinely down or set to noindex — so the caller can retry it
+    and the UI can label it honestly instead of showing a misleading "Noindex"."""
     loc = entry["loc"]
     out = {"loc": loc, "url": loc, "status": None, "title": "",
-           "page_type": classify_page_type(loc), "indexable": None, "word_count": None}
+           "page_type": classify_page_type(loc), "indexable": None,
+           "word_count": None, "score": None, "blocked": False}
+    # Spread the parallel burst so we don't hammer the one host all at once.
+    if jitter:
+        time.sleep(random.uniform(*ENRICH_JITTER_S))
     try:
         response, final_url, _ms = audit_service.safe_fetch(loc)
     except (audit_service.InvalidUrlError, audit_service.BlockedUrlError, audit_service.FetchError):
         return out
     out["url"] = final_url
     out["status"] = response.status_code
-    out["score"] = None
     ctype = (response.headers.get("content-type", "") or "").lower()
+    # A WAF/rate-limit block isn't "noindex" and isn't a real page status: keep
+    # indexable unknown (None) and flag it for the sequential retry pass.
+    if response.status_code in audit_service._BLOCK_STATUS:
+        out["blocked"] = True
+        return out
     if response.status_code != 200 or "html" not in ctype:
         out["indexable"] = False
         return out
     raw = (response.content or b"")[:3_000_000]
     soup = BeautifulSoup(raw, "html.parser")
-    out["title"] = (soup.title.get_text(" ", strip=True) if soup.title else "")[:512]
     out["page_type"] = classify_page_type(final_url, soup)
     out["indexable"] = _is_indexable(response, soup)
     html_text = raw.decode("utf-8", "ignore")
-    out["word_count"] = _main_content_word_count(html_text)
+    # Same JSON-LD-aware extraction Content Optimization uses: recovers the copy
+    # that lives in structured data on JS-rendered storefronts (Shopify/React),
+    # so word count and title match across the two tools instead of under-reading.
+    facts = content_score.extract(html_text, final_url)
+    out["title"] = (facts["title"]
+                    or (soup.title.get_text(" ", strip=True) if soup.title else ""))[:512]
+    out["word_count"] = facts["word_count"] or None
     # Genuine on-page/technical SEO score from the HTML we already fetched — no
     # extra request, and no PageSpeed/GSC calls (those are context, not score).
     out["score"] = _score_html(html_text, final_url, response.status_code, len(raw), out["page_type"])
@@ -304,6 +324,29 @@ def enrich_batch(entries: list[dict]) -> list[dict]:
         return list(pool.map(_enrich_one, entries))
 
 
+def _prioritize(db, domain: Domain, entries: list[dict]) -> list[dict]:
+    """Order discovered URLs gap-first so each run advances toward full coverage:
+    never-fetched pages first, then previously-blocked (retry on a cooled IP),
+    then pages still missing a word count, then the rest. Stable within a tier."""
+    rows = db.execute(
+        select(SitePage.url_key, SitePage.http_status, SitePage.word_count)
+        .where(SitePage.domain_id == domain.id)
+    ).all()
+    state = {rk: (hs, wc) for rk, hs, wc in rows}
+
+    def rank(e: dict) -> int:
+        hs, wc = state.get(page_history_service.url_key(e["loc"]), (None, None))
+        if hs is None:
+            return 0  # never enriched
+        if hs in audit_service._BLOCK_STATUS:
+            return 1  # was blocked — try again now
+        if wc is None:
+            return 2  # fetched but no readable content yet
+        return 3      # already has data — refresh last
+
+    return sorted(entries, key=rank)
+
+
 # ── Storage ──────────────────────────────────────────────────────────────────
 
 def _parse_lastmod(value: str | None) -> datetime | None:
@@ -313,9 +356,6 @@ def _parse_lastmod(value: str | None) -> datetime | None:
         return datetime.fromisoformat(value.replace("Z", "+00:00"))
     except ValueError:
         return None
-
-
-ENRICH_BATCH = 50
 
 
 def _store_urls(db, workspace: Workspace, entries: list[dict], source: str) -> None:
@@ -337,11 +377,20 @@ def _store_urls(db, workspace: Workspace, entries: list[dict], source: str) -> N
 def _apply_enrichment(db, workspace: Workspace, results: list[dict]) -> None:
     """Write fetched facts onto the already-stored rows (matched by the original
     URL), then commit the batch."""
+    now = datetime.now(timezone.utc)
     for r in results:
         page = page_history_service.get_or_create_page(db, workspace, r["loc"], title=r.get("title") or "")
         page.http_status = r.get("status")
-        page.indexable = r.get("indexable")
         page.page_type = r.get("page_type")
+        page.last_checked_at = now
+        if r.get("blocked"):
+            # Bot-protection blocked THIS check — but a block is transient (the IP
+            # cools down), so we must NOT destroy what an earlier successful scan
+            # read. Keep the last-known word count / score / indexability; the
+            # block status alone tells the UI to show "Blocked". A later run (or
+            # the gap-first ordering) refreshes it. Never wipe good data.
+            continue
+        page.indexable = r.get("indexable")
         page.word_count = r.get("word_count")
         if r.get("score") is not None:
             page.latest_audit_score = r["score"]
@@ -410,10 +459,14 @@ def run_discovery(workspace_id, domain_id, *, allow_crawl: bool = False, session
         run.truncated = truncated
         db.commit()
 
+        paused = False
         if entries and source not in ("none", "no_sitemap"):
             _store_urls(db, workspace, entries, source)
+            # Enrich gap-first, in small windows, pausing if the site starts
+            # rate-limiting us (see ENRICH_WINDOW / BLOCK_STOP_RATE).
+            worklist = _prioritize(db, domain, entries)
             enriched = 0
-            for i in range(0, len(entries), ENRICH_BATCH):
+            for i in range(0, len(worklist), ENRICH_WINDOW):
                 # Honor a user Stop: if the run was cancelled, keep what we have
                 # (pages are already stored) and finish early as 'cancelled'.
                 db.refresh(run, ["status"])
@@ -422,16 +475,28 @@ def run_discovery(workspace_id, domain_id, *, allow_crawl: bool = False, session
                     run.finished_at = datetime.now(timezone.utc)
                     db.commit()
                     return
-                batch = entries[i:i + ENRICH_BATCH]
-                _apply_enrichment(db, workspace, enrich_batch(batch))
-                enriched += len(batch)
+                window = worklist[i:i + ENRICH_WINDOW]
+                results = enrich_batch(window)
+                _apply_enrichment(db, workspace, results)
+                enriched += len(window)
                 run.pages_enriched = enriched
                 db.commit()
+                # The site has started clamping the whole IP — stop now rather
+                # than block every remaining page (and entrench the block). What
+                # we read is saved; a later run picks up the rest once it cools.
+                blocked = sum(1 for r in results if r.get("blocked"))
+                if len(window) >= ENRICH_WINDOW and blocked / len(window) >= BLOCK_STOP_RATE:
+                    paused = True
+                    break
 
-        # Don't overwrite a cancellation that landed during the last batch.
+        # Don't overwrite a cancellation that landed during the last window.
         db.refresh(run, ["status"])
         if run.status != "cancelled":
-            run.status = "completed"
+            if paused:
+                run.status = "partial"
+                run.error = "Paused: the site's bot protection began rate-limiting our reader. Run again later to continue the remaining pages."
+            else:
+                run.status = "completed"
         run.finished_at = datetime.now(timezone.utc)
         db.commit()
     except Exception as exc:  # noqa: BLE001 — background worker must not crash
@@ -543,6 +608,9 @@ def list_pages(db, domain: Domain, *, q: str, page_type: str, status: str, index
         where.append(SitePage.page_type == page_type)
     if status == "ok":
         where.append(SitePage.http_status == 200)
+    elif status == "blocked":
+        # Firewall / bot-protection blocks (shown as "Blocked" in the table).
+        where.append(SitePage.http_status.in_(audit_service._BLOCK_STATUS))
     elif status == "error":
         where.append(SitePage.http_status.isnot(None) & (SitePage.http_status >= 400))
     if indexable == "yes":

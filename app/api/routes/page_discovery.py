@@ -127,7 +127,7 @@ def score_content(
 @router.get("", response_model=DiscoveredPageList, summary="Discovered pages (paged, filterable)")
 def list_pages(
     type: str = Query("all", max_length=20, description="Page type filter"),
-    status: str = Query("all", pattern="^(all|ok|error)$"),
+    status: str = Query("all", pattern="^(all|ok|error|blocked)$"),
     indexable: str = Query("all", pattern="^(all|yes|no)$"),
     listing: PageQuery = Depends(page_query),
     ctx: DomainContext = Depends(get_domain_context),

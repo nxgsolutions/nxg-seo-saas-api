@@ -11,6 +11,9 @@ Docs: https://docs.dataforseo.com/v3/
 
 from __future__ import annotations
 
+import re
+from urllib.parse import urlparse
+
 import httpx
 
 from app.core.config import settings
@@ -134,6 +137,89 @@ def keyword_ideas(
     return [row for row in out if row["keyword"]]
 
 
+# DataForSEO sometimes returns an organic result wrapped in a Google redirect
+# (url = https://google.com/goto?url=<opaque token>, domain = "google.com"). The
+# token is encrypted, so the real destination can't be recovered from the URL —
+# but the same item carries it in `breadcrumb` ("https://host › crumb › crumb")
+# and `website_name`. `_resolve_serp_target` unwraps those to the real host and a
+# best-available destination URL, so we never store/show the google.com wrapper.
+_GOOGLE_REDIRECT_PATHS = ("/goto", "/url", "/aclk", "/imgres")
+_CRUMB_SEP = "›"  # › — DataForSEO's breadcrumb path separator
+_BARE_DOMAIN = re.compile(r"^[a-z0-9]([a-z0-9-]*\.)+[a-z]{2,}$")
+# Platform results carry no URL breadcrumb — just engagement text ("1.3Cr+
+# followers") — but their `website_name` names the platform ("YouTube › channel").
+# Map the known platforms to their host so the row isn't left as google.com.
+_PLATFORM_HOSTS = {
+    "youtube": "youtube.com", "instagram": "instagram.com", "facebook": "facebook.com",
+    "reddit": "reddit.com", "pinterest": "pinterest.com", "linkedin": "linkedin.com",
+    "x": "x.com", "twitter": "twitter.com", "tiktok": "tiktok.com",
+    "quora": "quora.com", "medium": "medium.com", "amazon": "amazon.in",
+}
+
+
+def _norm_host(value: str) -> str:
+    """Scheme/path/www-stripped lowercase host (mirrors ranked_keywords_service.norm_host)."""
+    h = re.sub(r"^https?://", "", (value or "").strip().lower()).split("/")[0]
+    return h[4:] if h.startswith("www.") else h
+
+
+def _is_google_redirect(url: str, domain: str) -> bool:
+    if _norm_host(domain) == "google.com" or _norm_host(url) == "google.com":
+        return True
+    try:
+        return urlparse(url).path.startswith(_GOOGLE_REDIRECT_PATHS)
+    except ValueError:
+        return False
+
+
+def _slug(crumb: str) -> str:
+    """A breadcrumb crumb ("Collections") → a path segment ("collections")."""
+    return re.sub(r"\s+", "-", crumb.strip().lower())
+
+
+def _resolve_serp_target(item: dict) -> tuple[str, str]:
+    """(url, domain) for a raw organic item, unwrapping Google redirect results.
+
+    Pure, no network. Non-wrapped items pass through unchanged. Wrapped items are
+    resolved from `breadcrumb` (preferred) or a bare-domain `website_name`; if
+    neither yields a host the original url/host is returned (stays google.com).
+    """
+    url = (item.get("url") or "").strip()
+    domain = item.get("domain") or ""
+    if not _is_google_redirect(url, domain):
+        return url, (_norm_host(domain) or _norm_host(url))
+
+    # breadcrumb: "https://theadvitya.com › collections › durga-idols"
+    crumbs = [c.strip() for c in (item.get("breadcrumb") or "").split(_CRUMB_SEP)]
+    first = crumbs[0] if crumbs else ""
+    if first.lower().startswith(("http://", "https://")):
+        parsed = urlparse(first)
+        host = _norm_host(parsed.netloc)
+        if host:
+            # Append clean (untruncated) path crumbs; a truncated one ("d…") ends it.
+            segs: list[str] = []
+            for c in crumbs[1:]:
+                if not c or "…" in c or "..." in c:
+                    break
+                segs.append(_slug(c))
+            path = "/" + "/".join(segs) if segs else "/"
+            return f"https://{host}{path}", host
+
+    # Fallback: website_name — either a bare domain ("gettyimages.in") or a
+    # platform name, often suffixed with the channel ("YouTube · Vision IAS").
+    # DataForSEO separates the two with " · " or " › " (padded with NBSPs).
+    name = item.get("website_name") or ""
+    head = re.split(r"[›·]", name, 1)[0].strip().lower()
+    if _BARE_DOMAIN.match(head):
+        return f"https://{head}/", head
+    if head in _PLATFORM_HOSTS:
+        host = _PLATFORM_HOSTS[head]
+        return f"https://{host}/", host
+
+    # Unresolved (e.g. a non-URL breadcrumb with an unknown brand name).
+    return url, (_norm_host(domain) or _norm_host(url))
+
+
 def serp_organic(
     keyword: str, *, location_name: str, language_code: str, depth: int = 20, env: str | None = None
 ) -> list[dict]:
@@ -156,14 +242,14 @@ def serp_organic(
         if item.get("type") != "organic":
             continue
         position = item.get("rank_absolute") or item.get("rank_group")
-        url = item.get("url")
-        if position is None or not url:
+        if position is None or not item.get("url"):
             continue
+        url, domain = _resolve_serp_target(item)
         out.append(
             {
                 "position": int(position),
                 "url": url,
-                "domain": item.get("domain") or "",
+                "domain": domain,
                 "title": item.get("title"),
             }
         )
@@ -203,15 +289,15 @@ def serp_organic_snapshot(
         if item.get("type") != "organic":
             continue
         position = item.get("rank_absolute") or item.get("rank_group")
-        url = item.get("url")
-        if position is None or not url:
+        if position is None or not item.get("url"):
             continue
+        url, domain = _resolve_serp_target(item)
         items.append(
             {
                 "type": "organic",
                 "rank_absolute": int(position),
                 "rank_group": item.get("rank_group"),
-                "domain": item.get("domain") or "",
+                "domain": domain,
                 "url": url,
                 "title": item.get("title"),
                 "description": item.get("description"),

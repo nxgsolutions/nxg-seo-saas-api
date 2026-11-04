@@ -41,7 +41,8 @@ class SitePage(Base):
     http_status: Mapped[int | None] = mapped_column(Integer, nullable=True)
     indexable: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
     page_type: Mapped[str | None] = mapped_column(String(20), nullable=True)  # home|blog|category|tag|content|other
-    # Clean main-content word count from the last discovery scan (trafilatura).
+    # Main-content word count from the last discovery scan (JSON-LD-aware
+    # extraction, same as Content Optimization). NULL when the page was blocked.
     word_count: Mapped[int | None] = mapped_column(Integer, nullable=True)
     # Cached editable article HTML, fetched on demand when a page is opened in the
     # content editor (not during discovery — keeps scans light for large sites).
