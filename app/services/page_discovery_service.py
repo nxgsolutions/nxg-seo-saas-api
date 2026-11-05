@@ -263,7 +263,11 @@ def _enrich_one(entry: dict, *, jitter: bool = True) -> dict:
     loc = entry["loc"]
     out = {"loc": loc, "url": loc, "status": None, "title": "",
            "page_type": classify_page_type(loc), "indexable": None,
-           "word_count": None, "score": None, "blocked": False}
+           "word_count": None, "score": None, "blocked": False,
+           # Full score breakdown, captured so the whole-site score can reuse it
+           # without re-fetching (persisted as a PageSnapshot in _apply_enrichment).
+           "categories": None, "checks": None, "audit_score": None,
+           "content_score": None, "metrics": None, "facts": None, "size": None}
     # Spread the parallel burst so we don't hammer the one host all at once.
     if jitter:
         time.sleep(random.uniform(*ENRICH_JITTER_S))
@@ -296,13 +300,25 @@ def _enrich_one(entry: dict, *, jitter: bool = True) -> dict:
     out["word_count"] = facts["word_count"] or None
     # Genuine on-page/technical SEO score from the HTML we already fetched — no
     # extra request, and no PageSpeed/GSC calls (those are context, not score).
-    out["score"] = _score_html(html_text, final_url, response.status_code, len(raw), out["page_type"])
+    # Keep the whole breakdown so _apply_enrichment can snapshot it for reuse.
+    ps = _score_page(html_text, final_url, response.status_code, len(raw), out["page_type"])
+    if ps is not None:
+        out["score"] = ps.overall
+        out["categories"] = {c.id: c.score for c in ps.categories}
+        out["checks"] = [{"id": c["id"], "label": c["label"], "status": c["status"]} for c in ps.audit_checks]
+        out["audit_score"] = ps.audit_score
+        out["content_score"] = ps.content_score
+        out["metrics"] = ps.metrics
+        out["facts"] = facts
+        out["size"] = len(raw)
     return out
 
 
-def _score_html(html: str, final_url: str, status_code: int, size: int, page_type: str) -> int | None:
-    """Compose the genuine page score from already-fetched HTML (pure, no I/O).
-    Deferred import keeps page_discovery/page_score free of an import cycle."""
+def _score_page(html: str, final_url: str, status_code: int, size: int, page_type: str):
+    """Compose the full genuine page score from already-fetched HTML (pure, no
+    I/O). Returns a page_score_service.PageScoreResult (overall + category
+    breakdown + checks) so the whole-site score can reuse it without re-fetching,
+    or None if scoring fails. Deferred import avoids an import cycle."""
     try:
         from app.services import page_score_service
 
@@ -311,7 +327,7 @@ def _score_html(html: str, final_url: str, status_code: int, size: int, page_typ
             load_time_ms=0, page_size_bytes=size, psi=None,
         )
         audit.html = html  # analyze_html leaves it unset; compose re-reads it
-        return page_score_service.compose(audit, page_type=page_type).overall
+        return page_score_service.compose(audit, page_type=page_type)
     except Exception:  # noqa: BLE001 — scoring must never break enrichment
         return None
 
@@ -392,12 +408,28 @@ def _apply_enrichment(db, workspace: Workspace, results: list[dict]) -> None:
             continue
         page.indexable = r.get("indexable")
         page.word_count = r.get("word_count")
-        if r.get("score") is not None:
-            page.latest_audit_score = r["score"]
         if r.get("url") and r["url"] != page.url:
             page.url = r["url"]
         if r.get("title"):
             page.title = r["title"][:512]
+        if r.get("score") is not None:
+            page.latest_audit_score = r["score"]
+            # Persist the full score as a dated snapshot so the whole-site score
+            # can reuse this crawl (overall + category breakdown) with no re-fetch.
+            # A snapshot failure must never break enrichment, so guard it.
+            try:
+                page_history_service.record(
+                    db, workspace, r.get("url") or r["loc"], extracted=r.get("facts"),
+                    source="discovery", overall_score=r["score"],
+                    category_scores=r.get("categories") or {}, checks=r.get("checks") or [],
+                    audit_score=r.get("audit_score"), content_score_value=r.get("content_score"),
+                    tech=page_history_service.audit_tech(
+                        r.get("status") or 0, 0, r.get("size") or 0,
+                        r.get("metrics") or {}, r.get("checks") or []),
+                    commit=False,
+                )
+            except Exception:  # noqa: BLE001 — snapshot is a bonus, never fail the scan
+                pass
     db.commit()
 
 
@@ -667,10 +699,76 @@ def list_pages(db, domain: Domain, *, q: str, page_type: str, status: str, index
 CONTENT_HTML_CAP = 200_000  # keep cached/editor HTML bounded
 
 
-def _readable_html(html: str) -> str:
-    """Clean, editable main-content HTML. Shared with the page scorer
-    (content_score.readable_html) so the editor and the score read the same body."""
-    return content_score.readable_html(html)
+# Attributes worth keeping on the editor HTML; everything else (framework classes,
+# inline styles, data-*, event handlers) is dropped so the body is clean to edit.
+_KEEP_ATTRS = {
+    "a": {"href", "title"},
+    "img": {"src", "alt", "title", "width", "height"},
+    "th": {"colspan", "rowspan"},
+    "td": {"colspan", "rowspan"},
+}
+
+
+def _normalize_editor_html(html: str, base_url: str) -> str:
+    """Make extractor output safe and faithful for the rich-text editor: re-parse
+    with lxml (fixes invalid block-in-<p> nesting the way a browser does), rewrite
+    relative img/href to absolute so images and links actually resolve, strip
+    framework noise (classes, inline styles, lazy-load attrs), and drop the empty
+    blocks the nesting fix leaves behind."""
+    soup = BeautifulSoup(html or "", "lxml")
+    body = soup.body or soup
+
+    for img in body.find_all("img"):
+        src = img.get("src") or img.get("data-src") or img.get("data-original")
+        if src and base_url:
+            img["src"] = urljoin(base_url, src)
+    for a in body.find_all("a", href=True):
+        if base_url:
+            a["href"] = urljoin(base_url, a["href"])
+
+    # Keep only a small allow-list of attributes per tag.
+    for tag in body.find_all(True):
+        allowed = _KEEP_ATTRS.get(tag.name, set())
+        for attr in list(tag.attrs):
+            if attr not in allowed:
+                del tag[attr]
+
+    # Drop images we could not resolve (relative src with no base, or data-less).
+    for img in body.find_all("img"):
+        if not (img.get("src") or "").strip():
+            img.decompose()
+
+    # Remove empty blocks left by extraction / the nesting fix.
+    for tag in body.find_all(["p", "div", "span", "li"]):
+        if not tag.get_text(strip=True) and not tag.find("img"):
+            tag.decompose()
+
+    inner = body.decode_contents() if hasattr(body, "decode_contents") else str(body)
+    return inner.strip()
+
+
+def _readable_html(html: str, base_url: str = "") -> str:
+    """Editable main-content HTML for the content editor — the full article as it
+    is, WITH images and absolute links, in valid structure.
+
+    trafilatura (recall-favouring, images on) pulls the article out of the page;
+    `_normalize_editor_html` then repairs the markup so the editor renders exactly
+    what was extracted. The page scorer keeps its own `content_score.readable_html`
+    (text-only, unchanged); the live editor score reads whatever body is in the
+    editor, so the two stay consistent."""
+    out = None
+    try:
+        import trafilatura
+
+        out = trafilatura.extract(
+            html or "", output_format="html", include_formatting=True,
+            include_links=True, include_images=True, include_tables=True,
+            favor_recall=True)
+    except Exception:  # noqa: BLE001 — extraction must never break the editor
+        out = None
+    if not out:
+        out = content_score.article_html(html)
+    return _normalize_editor_html(out, base_url)
 
 
 def get_page(db, domain: Domain, page_id: str) -> SitePage | None:
@@ -708,7 +806,7 @@ def fetch_page_content(db, domain: Domain, page_id: str, *, refresh: bool = Fals
 
     raw = (response.content or b"")[:3_000_000].decode("utf-8", "ignore")
     facts = content_score.extract(raw, final_url)  # title + meta are reliable from <title>/<meta>
-    body_html = _readable_html(raw)[:CONTENT_HTML_CAP]
+    body_html = _readable_html(raw, final_url)[:CONTENT_HTML_CAP]
     # Word count from the content we actually show, so the editor and table agree.
     word_count = len(BeautifulSoup(body_html, "html.parser").get_text(" ", strip=True).split()) or None
     payload = {

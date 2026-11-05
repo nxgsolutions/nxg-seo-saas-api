@@ -74,4 +74,5 @@ def get_score(
         running=running,
         can_refetch=domain_score_service.can_refetch(latest),
         next_refetch_at=domain_score_service.next_refetch_at(latest),
+        last_crawled_at=domain_score_service.last_crawled_at(db, ctx.domain),
     )

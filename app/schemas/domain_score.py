@@ -73,6 +73,9 @@ class DomainScoreView(BaseModel):
     # becomes available (last run + the weekly refresh window).
     can_refetch: bool = True
     next_refetch_at: datetime | None = None
+    # When Page Discovery last crawled any page — the real freshness of the data
+    # the score aggregates (distinct from the score's own created_at).
+    last_crawled_at: datetime | None = None
 
 
 class StoredPageScore(BaseModel):

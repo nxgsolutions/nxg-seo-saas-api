@@ -8,20 +8,21 @@ from app.services import audit_service, page_discovery_service
 from tests.fixtures.sample_pages import RICH_BLOG, THIN_16_WORDS
 
 
-def test_score_html_is_genuine_and_orders_pages() -> None:
-    rich = page_discovery_service._score_html(
+def test_score_page_is_genuine_and_orders_pages() -> None:
+    rich = page_discovery_service._score_page(
         RICH_BLOG, "https://x.com/blog/guide", 200, len(RICH_BLOG.encode()), "blog")
-    thin = page_discovery_service._score_html(
+    thin = page_discovery_service._score_page(
         THIN_16_WORDS, "https://x.com/contact", 200, len(THIN_16_WORDS.encode()), "other")
     assert rich is not None and thin is not None
-    assert rich > thin
-    assert thin < 80  # thin content keeps a page out of the "Good"/green band
+    assert rich.overall > thin.overall
+    assert thin.overall < 80  # thin content keeps a page out of the "Good"/green band
+    assert rich.categories  # full breakdown is carried, not just the overall number
 
 
 def test_scoring_makes_no_pagespeed_call() -> None:
     import app.services.psi_service as psi_service
     with patch.object(psi_service, "run_psi") as run_psi:
-        page_discovery_service._score_html(
+        page_discovery_service._score_page(
             RICH_BLOG, "https://x.com/blog/guide", 200, len(RICH_BLOG.encode()), "blog")
     assert run_psi.call_count == 0
 

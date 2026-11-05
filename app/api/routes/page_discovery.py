@@ -72,8 +72,11 @@ def cancel(
     return _run_out(run) if run is not None else None
 
 
+# NB: not named `status` — that would rebind the module-level `fastapi.status`
+# imported above, breaking every `status.HTTP_*` reference in this file (they'd
+# raise AttributeError -> 500 instead of the intended 404). Route path is still /status.
 @router.get("/status", response_model=DiscoveryRunOut | None, summary="Latest scan status")
-def status(
+def discovery_status(
     ctx: DomainContext = Depends(get_domain_context),
     db: Session = Depends(get_db),
 ) -> DiscoveryRunOut | None:

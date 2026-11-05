@@ -6,6 +6,7 @@ only allow http(s).
 """
 
 import ipaddress
+import logging
 import re
 import socket
 import time
@@ -16,8 +17,22 @@ from urllib.parse import urljoin, urlparse
 import httpx
 from bs4 import BeautifulSoup
 
+from app.core.config import settings
+from app.services import proxy_pool
+
+# Dedicated fetch log (its own file via logging_config "app.fetch"): one line per
+# website fetch recording whether it came DIRECT or via a PROXY, plus status/URL.
+fetch_log = logging.getLogger("app.fetch")
+
+
+def _mask_proxy(proxy: str | None) -> str:
+    """'direct', or the proxy's host:port only — never the user:pass."""
+    return proxy.rsplit("@", 1)[-1] if proxy else "direct"
+
 MAX_REDIRECTS = 5
 FETCH_TIMEOUT_SECONDS = 12.0
+# Residential proxies add a hop and are slower, so give a proxied fetch more room.
+FETCH_PROXY_TIMEOUT_SECONDS = 25.0
 MAX_HTML_BYTES = 3_000_000  # cap parsing work
 
 # Realistic mainstream-browser User-Agents (no bot suffix): many WAFs / CDNs
@@ -157,13 +172,16 @@ def _friendly_fetch_error(exc: httpx.HTTPError) -> str:
     return "Could not fetch the page. Check the URL and try again."
 
 
-def _fetch_once(url: str, headers: dict[str, str]) -> tuple[httpx.Response, str, int]:
-    """One attempt: manual, host-validated redirects. Returns (response, final_url, elapsed_ms)."""
+def _fetch_once(url: str, headers: dict[str, str], proxy: str | None = None) -> tuple[httpx.Response, str, int]:
+    """One attempt: manual, host-validated redirects, optionally through a proxy.
+    Returns (response, final_url, elapsed_ms). The SSRF guard (`_assert_public_host`)
+    still runs on every hop, so a proxy never weakens it."""
     current = url
     start = time.perf_counter()
+    timeout = FETCH_PROXY_TIMEOUT_SECONDS if proxy else FETCH_TIMEOUT_SECONDS
 
     with httpx.Client(
-        follow_redirects=False, timeout=FETCH_TIMEOUT_SECONDS, headers=headers
+        follow_redirects=False, timeout=timeout, headers=headers, proxy=proxy
     ) as client:
         for _ in range(MAX_REDIRECTS + 1):
             parsed = urlparse(current)
@@ -186,32 +204,74 @@ def _fetch_once(url: str, headers: dict[str, str]) -> tuple[httpx.Response, str,
     raise FetchError("Too many redirects.")
 
 
-FETCH_RETRIES = 2  # extra attempts after the first when a WAF blocks us
+FETCH_RETRIES = 2       # extra attempts after the first when a WAF blocks us
+FETCH_PROXY_MAX_TRIES = 4  # when proxies are configured, try up to this many exit IPs
 
 
 def _fetch(url: str, user_agent: str = _USER_AGENT) -> tuple[httpx.Response, str, int]:
     """Fetch a page as a browser would (full headers). Bot-protection services
-    (e.g. Cloudflare Bot Fight Mode) intermittently answer a browser request
-    with a 401/403/429/503 challenge, so when that happens we retry a few times
-    with a short backoff, alternating the browser UA and adding a search-engine
-    referer. Connection errors are not retried. Returns (response, final_url, ms)."""
-    response, final_url, elapsed = _fetch_once(url, _browser_headers(user_agent))
-    if response.status_code not in _BLOCK_STATUS:
-        return response, final_url, elapsed
+    (e.g. Cloudflare Bot Fight Mode) answer a browser request with a 401/403/429/503
+    challenge, so on a block we retry with a short backoff, alternating the browser
+    UA and adding a search-engine referer.
 
-    uas = [MOBILE_UA if user_agent != MOBILE_UA else DESKTOP_UA, user_agent]
-    for attempt in range(FETCH_RETRIES):
-        time.sleep(0.5 * (attempt + 1))
+    The proxy is a FALLBACK, never used for every scrape. The FIRST attempt is
+    always DIRECT; the residential proxy is tried only as a SECOND step, and only
+    when the direct attempt failed — the page was blocked (401/403/429/503), the
+    site errored (5xx), or it didn't load at all (connection error / timeout). A
+    clean 200/3xx, or a definite 404, is returned from the direct attempt and
+    never spends proxy bandwidth. Each proxy retry rotates to a FRESH exit IP (a
+    new trusted IP is what clears a block). With no proxy configured the behaviour
+    is unchanged (direct, UA-rotating retries on block). Returns (response, final_url, ms)."""
+    proxies = proxy_pool.shuffled(settings.fetch_proxies)  # [] when unset
+    uas = [user_agent, MOBILE_UA if user_agent != MOBILE_UA else DESKTOP_UA]
+    retries = max(FETCH_RETRIES, min(len(proxies), FETCH_PROXY_MAX_TRIES)) if proxies else FETCH_RETRIES
+
+    def _failed(status: int) -> bool:
+        """Did the direct hit fail in a way a clean proxy IP might fix? Blocks
+        always; server errors (5xx) only when a proxy pool exists (so no-proxy
+        behaviour is unchanged). A plain 404 etc. is NOT a failure to retry."""
+        return status in _BLOCK_STATUS or (bool(proxies) and status >= 500)
+
+    response = final_url = None
+    elapsed = 0
+    for attempt in range(1 + retries):
+        if attempt:
+            time.sleep(0.5 * attempt)
         headers = _browser_headers(uas[attempt % len(uas)])
-        headers["Referer"] = "https://www.google.com/"
+        if attempt:
+            headers["Referer"] = "https://www.google.com/"
+        # First attempt direct; retries rotate through the proxy pool (fresh IP).
+        proxy = None if attempt == 0 else (proxies[(attempt - 1) % len(proxies)] if proxies else None)
         try:
-            r2, final2, elapsed2 = _fetch_once(url, headers)
+            r, fu, el = _fetch_once(url, headers, proxy=proxy)
         except FetchError:
-            break  # connection error on retry — keep the first (clearer) result
-        elapsed += elapsed2
-        if r2.status_code not in _BLOCK_STATUS:
-            return r2, final2, elapsed
-        response, final_url = r2, final2  # keep the latest block to report
+            # "Page didn't come" (connection error / timeout).
+            # No proxies: keep the original behaviour — a first-attempt error
+            # propagates; a later one keeps the earlier (clearer) result.
+            if not proxies:
+                if response is not None:
+                    break
+                fetch_log.info("error via=%s attempt=%d url=%s (page did not load)",
+                               _mask_proxy(proxy), attempt + 1, url)
+                raise
+            # Proxies: fall back to the next exit IP. On the final attempt,
+            # surface the earlier result or re-raise.
+            if attempt + 1 >= 1 + retries:
+                if response is not None:
+                    break
+                fetch_log.info("error via=%s attempts=%d url=%s (page did not load)",
+                               _mask_proxy(proxy), attempt + 1, url)
+                raise
+            continue
+        elapsed += el
+        if not _failed(r.status_code):
+            fetch_log.info("ok    status=%s via=%s attempt=%d url=%s",
+                           r.status_code, _mask_proxy(proxy), attempt + 1, url)
+            return r, fu, elapsed
+        response, final_url = r, fu  # keep the latest failure to report
+    fetch_log.info("fail  status=%s via=%s attempts=%d url=%s",
+                   response.status_code if response is not None else "-",
+                   _mask_proxy(proxy), attempt + 1, url)
     return response, final_url, elapsed
 
 

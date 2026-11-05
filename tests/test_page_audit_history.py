@@ -124,3 +124,27 @@ def test_history_requires_membership(client: TestClient, stub_audit) -> None:
 def test_run_audit_requires_auth(client: TestClient) -> None:
     resp = client.post(f"{WORKSPACES_URL}/{uuid4()}/page-audits", json={"url": "example.com"})
     assert resp.status_code == 401
+
+
+def _blocked_result() -> AuditResult:
+    """A page that blocked us / returned a server error (e.g. Cloudflare 503)."""
+    return AuditResult(
+        url="https://blocked.example/", final_url="https://blocked.example/",
+        status_code=503, load_time_ms=120, page_size_bytes=500,
+        score=57, checks=[Check("status", "HTTP status", "fail", "Returned status 503.", 2)],
+        metrics={},
+    )
+
+
+def test_blocked_page_returns_502_and_saves_nothing(client: TestClient, monkeypatch) -> None:
+    """A persistent block/503 must not be saved as a junk capped score — the route
+    returns 502 so the UI can show a retry message and keep the last good score."""
+    monkeypatch.setattr(audit_service, "run_audit", lambda url, device="desktop": _blocked_result())
+    _signup(client)
+    wid = _workspace_id(client)
+
+    resp = client.post(f"{WORKSPACES_URL}/{wid}/page-audits", json={"url": "blocked.example"})
+    assert resp.status_code == 502
+    assert "503" in resp.json()["detail"]
+    # Nothing was persisted.
+    assert client.get(f"{WORKSPACES_URL}/{wid}/page-audits").json() == []

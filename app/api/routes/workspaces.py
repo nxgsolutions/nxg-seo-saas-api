@@ -320,6 +320,16 @@ def run_page_audit(
             status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)
         )
 
+    # The page blocked our checker or returned a server error (e.g. Cloudflare
+    # 503): we never actually read the real page, so don't save a misleading
+    # capped score. Tell the user to retry; the UI keeps the last good score.
+    if result.status_code in audit_service._BLOCK_STATUS:
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=(f"We couldn't read this page right now — it blocked our checker or "
+                    f"returned HTTP {result.status_code}. Please try again shortly."),
+        )
+
     # Compose the genuine overall SEO score + category breakdown from this audit
     # (no extra fetch) and persist them on the audit, so one saved audit carries
     # the score, the breakdown and the fixes — and the Discovery column stays
@@ -424,6 +434,15 @@ def run_page_score(
     except FetchError as exc:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)
+        )
+
+    # Blocked / server-errored page: we didn't read the real page, so don't save
+    # a misleading capped score — ask the user to retry.
+    if result.status_code in audit_service._BLOCK_STATUS:
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=(f"We couldn't read this page right now — it blocked our checker or "
+                    f"returned HTTP {result.status_code}. Please try again shortly."),
         )
 
     # Record a page-history snapshot (source "score"). History must never fail

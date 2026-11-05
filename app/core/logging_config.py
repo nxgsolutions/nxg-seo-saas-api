@@ -62,6 +62,22 @@ def configure_logging() -> None:
         }
         ai_handlers.append("ai_file")
 
+    # Dedicated website-fetch log on its OWN rotating file (direct vs proxy, per
+    # page fetch), kept separate from the app logs so proxy usage is easy to track.
+    fetch_handlers = ["console"]
+    if settings.FETCH_LOG_FILE:
+        fpath = Path(settings.FETCH_LOG_FILE)
+        fpath.parent.mkdir(parents=True, exist_ok=True)
+        handlers["fetch_file"] = {
+            "class": "logging.handlers.RotatingFileHandler",
+            "formatter": "standard",
+            "filename": str(fpath),
+            "maxBytes": 5_000_000,  # ~5 MB per file
+            "backupCount": 3,
+            "encoding": "utf-8",
+        }
+        fetch_handlers = ["fetch_file"]  # own file only — don't flood the console
+
     logging.config.dictConfig({
         "version": 1,
         "disable_existing_loggers": False,
@@ -76,6 +92,8 @@ def configure_logging() -> None:
             "app.ai": {"level": ai_level, "handlers": ai_handlers, "propagate": False},
             # Per-request API flow (method/path/params in, status/body/ms out).
             "app.api": {"level": api_level, "handlers": ai_handlers, "propagate": False},
+            # One line per website fetch (direct vs proxy, status, URL) → own file.
+            "app.fetch": {"level": "INFO", "handlers": fetch_handlers, "propagate": False},
             # Keep uvicorn/access on our formatter instead of its own.
             "uvicorn": {"level": root_level, "handlers": ["console"], "propagate": False},
             "uvicorn.error": {"level": root_level, "handlers": ["console"], "propagate": False},

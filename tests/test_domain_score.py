@@ -4,7 +4,6 @@ from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
 from app.services import domain_score_service as dss
-from app.services.audit_service import FetchError
 from app.services.crawl_service import Check
 
 
@@ -111,20 +110,7 @@ def test_refetch_blocked_until_window_then_allowed() -> None:
         assert dss.can_refetch(fresh) is True
 
 
-# ── Block handling (monkeypatched fetch, no DB/network) ──────────────────────
-
-def test_fetch_score_treats_block_as_failed(monkeypatch) -> None:
-    """A page returning a firewall block (503) is failed+blocked, never scored,
-    so it isn't snapshotted and reused (which would stop us ever retrying it)."""
-    monkeypatch.setattr(dss.page_score_service, "run_page_score",
-                        lambda url, **kw: SimpleNamespace(status_code=503))
-    out = dss._fetch_score(None, None, SimpleNamespace(url="https://x.test/"))
-    assert out == {"failed": True, "blocked": True}
-
-
-def test_fetch_score_fetch_error_failed_not_blocked(monkeypatch) -> None:
-    def boom(url, **kw):
-        raise FetchError("nope")
-    monkeypatch.setattr(dss.page_score_service, "run_page_score", boom)
-    out = dss._fetch_score(None, None, SimpleNamespace(url="https://x.test/"))
-    assert out == {"failed": True, "blocked": False}
+# Note: the whole-site score no longer fetches pages — it aggregates the latest
+# stored per-page scores that Page Discovery crawled. Block handling now lives in
+# the per-page audit route (returns 502 instead of saving a junk score) and is
+# covered by the route tests / end-to-end checks.

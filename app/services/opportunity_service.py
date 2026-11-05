@@ -437,7 +437,7 @@ def competitor_analytics(
     db: Session, domain: Domain, *, country: str = domain_analytics_service.DEFAULT_COUNTRY,
     language: str = "en",
 ) -> dict:
-    """Whole-site competitor analytics — estimated organic traffic, total ranking
+    """All competitor analytics — estimated organic traffic, total ranking
     keywords, top-3/top-10 counts, traffic share and domain rank — for our domain
     plus the competitors found in our tracked-keyword SERPs.
 
@@ -498,6 +498,51 @@ def competitor_analytics(
         "fetched_at": max((r["fetched_at"] for r in rows), default=None),
         "missing": [t for t in targets if t not in stored],
         "rows": rows,
+    }
+
+
+def competitor_analytics_history(
+    db: Session, domain: Domain, *, country: str = domain_analytics_service.DEFAULT_COUNTRY,
+    language: str = "en",
+) -> dict:
+    """Per-competitor estimated-traffic and ranking-keyword time series.
+
+    Built from the dated rows in `domain_analytics_snapshots` for the same domains
+    and market as `competitor_analytics` (our domain + its SERP competitors).
+    Read-only: nothing is estimated. A domain stored on only one day yields a
+    single point (the chart needs >= 2 points to draw a line)."""
+    host = _norm_host(domain.domain)
+    footprint = {c["domain"]: c for c in strategy(db, domain)["competitors"]}
+    targets = [host, *footprint]
+    loc = domain_analytics_service.location_code_for(country)
+    env = data_env.env_for_domain(db, domain)
+    stored = domain_analytics_service.history(
+        db, targets, location_code=loc, language=language, env=env)
+
+    all_dates: set[date] = set()
+    competitors = []
+    for t in targets:
+        snaps = stored.get(t)
+        if not snaps:
+            continue
+        points = [{
+            "captured_on": s.fetched_on,
+            "organic_traffic": round(s.organic_etv),
+            "ranking_keywords": s.organic_count,
+        } for s in snaps]
+        all_dates.update(s.fetched_on for s in snaps)
+        competitors.append({"domain": t, "is_you": t == host, "points": points})
+
+    # Strongest (most recent traffic) first, so the chart's top lines are picked.
+    competitors.sort(
+        key=lambda c: c["points"][-1]["organic_traffic"] if c["points"] else 0,
+        reverse=True)
+    return {
+        "domain": domain.domain,
+        "environment": env,
+        "country": country,
+        "dates": sorted(all_dates),
+        "competitors": competitors,
     }
 
 

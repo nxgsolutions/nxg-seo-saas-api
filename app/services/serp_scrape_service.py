@@ -30,7 +30,7 @@ from sqlalchemy.orm import Session
 from app.core.config import settings
 from app.models.keyword_analysis import Keyword, SerpSnapshot, SerpSnapshotItem
 from app.services import dataforseo_client, keyword_analysis_service as kas
-from app.services import data_env, keyword_scoring
+from app.services import data_env, keyword_scoring, proxy_pool
 from app.services.dataforseo_client import DataForSeoError
 
 _ENDPOINT = "https://html.duckduckgo.com/html/"
@@ -89,19 +89,8 @@ class SerpRow:
 
 
 def _proxy_urls() -> list[str]:
-    """Parse settings.SERP_PROXIES ('host:port:user:pass,...') into httpx proxy
-    URLs. Malformed entries are skipped rather than crashing a scrape."""
-    urls: list[str] = []
-    for line in (settings.SERP_PROXIES or "").split(","):
-        line = line.strip()
-        if not line:
-            continue
-        parts = line.split(":")
-        if len(parts) != 4:
-            continue  # skip malformed entry
-        host, port, user, pw = parts
-        urls.append(f"http://{user}:{pw}@{host}:{port}")
-    return urls
+    """SERP scraper proxy URLs from settings.SERP_PROXIES (shared parser)."""
+    return proxy_pool.proxy_urls(settings.SERP_PROXIES)
 
 def _pick_proxy() -> str | None:
     urls = _proxy_urls()

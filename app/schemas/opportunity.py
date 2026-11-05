@@ -196,7 +196,7 @@ class CompetitorAnalyticsRefresh(BaseModel):
 
 
 class CompetitorAnalyticsResponse(BaseModel):
-    """Whole-site competitor analytics from DataForSEO, served from Postgres."""
+    """All competitor analytics from DataForSEO, served from Postgres."""
     domain: str
     is_sample: bool = False          # True in a sandbox workspace (dummy data)
     environment: str = "live"        # "live" | "sandbox"
@@ -208,6 +208,27 @@ class CompetitorAnalyticsResponse(BaseModel):
     missing: list[str] = []          # domains with no stored metrics yet
     rows: list[CompetitorAnalyticsRow]
     refresh: CompetitorAnalyticsRefresh | None = None
+
+
+class AnalyticsHistoryPoint(BaseModel):
+    captured_on: date
+    organic_traffic: int
+    ranking_keywords: int
+
+
+class AnalyticsHistorySeries(BaseModel):
+    domain: str
+    is_you: bool
+    points: list[AnalyticsHistoryPoint]
+
+
+class CompetitorAnalyticsHistoryResponse(BaseModel):
+    """Per-competitor estimated-traffic / ranking-keyword trend, from stored snapshots."""
+    domain: str
+    environment: str = "live"        # "live" | "sandbox"
+    country: str = "in"
+    dates: list[date] = []
+    competitors: list[AnalyticsHistorySeries] = []
 
 
 class RankedKeywordRow(BaseModel):

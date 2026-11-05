@@ -13,6 +13,7 @@ from app.schemas.opportunity import (
     PageInsightResponse,
     TrackKeywordResponse,
     CompetitorAnalyticsResponse,
+    CompetitorAnalyticsHistoryResponse,
     CompetitorKeywordsResponse,
     OpportunityChangeResponse,
     OpportunityStrategyResponse,
@@ -144,12 +145,22 @@ def _topic_regex(ctx: DomainContext) -> str | None:
 
 
 @router.get("/strategy/analytics", response_model=CompetitorAnalyticsResponse,
-            summary="Whole-site competitor analytics (stored DataForSEO Labs data)")
+            summary="All competitor analytics (stored DataForSEO Labs data)")
 def competitor_analytics(country: str = _COUNTRY,
                          ctx: DomainContext = Depends(get_domain_context),
                          db: Session = Depends(get_db)) -> CompetitorAnalyticsResponse:
     return CompetitorAnalyticsResponse(
         **opportunity_service.competitor_analytics(db, ctx.domain, country=_market(ctx, country))
+    )
+
+
+@router.get("/strategy/analytics/history", response_model=CompetitorAnalyticsHistoryResponse,
+            summary="Per-competitor estimated-traffic / ranking-keyword trend (stored)")
+def competitor_analytics_history(country: str = _COUNTRY,
+                                 ctx: DomainContext = Depends(get_domain_context),
+                                 db: Session = Depends(get_db)) -> CompetitorAnalyticsHistoryResponse:
+    return CompetitorAnalyticsHistoryResponse(
+        **opportunity_service.competitor_analytics_history(db, ctx.domain, country=_market(ctx, country))
     )
 
 

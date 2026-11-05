@@ -214,3 +214,122 @@ def test_image_detail_limit_is_explicit():
     result = analyze_html(html, 'https://example.com/', 200, 100, len(html))
     assert len(result.metrics['image_details']) == 200
     assert result.metrics['image_details_truncated'] is True
+
+
+# ── Residential-proxy fetch backend (mocked, no network) ─────────────────────
+
+from app.services import proxy_pool  # noqa: E402
+
+
+class _Resp:
+    """Minimal httpx.Response stand-in (only what _fetch reads)."""
+
+    def __init__(self, status_code: int):
+        self.status_code = status_code
+
+
+def test_proxy_pool_parsing():
+    assert proxy_pool.proxy_urls("") == []
+    assert proxy_pool.proxy_urls(None) == []
+    assert proxy_pool.proxy_urls("h:80:u:p") == ["http://u:p@h:80"]
+    # ready-made URLs pass through; malformed (wrong field count) is skipped.
+    assert proxy_pool.proxy_urls("http://u:p@h:80, nope:1, a:8:u:p") == [
+        "http://u:p@h:80", "http://u:p@a:8"]
+
+
+def _patch_fetch(monkeypatch, statuses, proxies):
+    """Script _fetch_once to return `statuses` in order, recording the proxy used
+    each call. `proxies` is what proxy_pool.shuffled yields. Returns the call log."""
+    calls = []
+
+    def fake_once(url, headers, proxy=None):
+        calls.append(proxy)
+        return _Resp(statuses[min(len(calls) - 1, len(statuses) - 1)]), url, 1
+
+    monkeypatch.setattr(audit_service, "_fetch_once", fake_once)
+    monkeypatch.setattr(audit_service.time, "sleep", lambda *_: None)
+    monkeypatch.setattr(audit_service.proxy_pool, "shuffled", lambda raw: list(proxies))
+    return calls
+
+
+def test_fetch_first_200_never_touches_proxy(monkeypatch):
+    """A page that isn't blocked is fetched DIRECT — no proxy bandwidth spent."""
+    calls = _patch_fetch(monkeypatch, [200], ["http://u:p@a:1", "http://u:p@b:2"])
+    r, _url, _ms = audit_service._fetch("https://ex.com/")
+    assert r.status_code == 200
+    assert calls == [None]  # only the direct attempt happened
+
+
+def test_fetch_retries_through_proxy_after_block(monkeypatch):
+    """On a block the FIRST attempt is direct, then retries rotate exit IPs via
+    the proxy pool, and the recovered 200 is returned."""
+    calls = _patch_fetch(monkeypatch, [503, 200], ["http://u:p@a:1", "http://u:p@b:2"])
+    r, _url, _ms = audit_service._fetch("https://ex.com/")
+    assert r.status_code == 200
+    assert calls[0] is None                  # first attempt DIRECT
+    assert calls[1] == "http://u:p@a:1"       # first retry via a proxy exit IP
+
+
+def test_fetch_rotates_to_a_fresh_exit_ip_each_retry(monkeypatch):
+    """Every blocked retry uses a different proxy endpoint (fresh exit IP)."""
+    calls = _patch_fetch(monkeypatch, [503, 503, 503, 200],
+                         ["http://u:p@a:1", "http://u:p@b:2", "http://u:p@c:3"])
+    r, _url, _ms = audit_service._fetch("https://ex.com/")
+    assert r.status_code == 200
+    assert calls[0] is None
+    assert calls[1:4] == ["http://u:p@a:1", "http://u:p@b:2", "http://u:p@c:3"]
+
+
+def test_fetch_without_proxies_is_all_direct(monkeypatch):
+    """No proxies configured → unchanged behaviour: direct + UA-rotating retries,
+    all with proxy=None."""
+    calls = _patch_fetch(monkeypatch, [503], proxies=[])
+    r, _url, _ms = audit_service._fetch("https://ex.com/")
+    assert r.status_code == 503
+    assert calls == [None, None, None]  # 1 + FETCH_RETRIES attempts, all direct
+
+
+def test_fetch_falls_back_to_proxy_on_server_error(monkeypatch):
+    """A 5xx (site errored) is a failure the proxy fallback also covers."""
+    calls = _patch_fetch(monkeypatch, [500, 200], ["http://u:p@a:1"])
+    r, _url, _ms = audit_service._fetch("https://ex.com/")
+    assert r.status_code == 200
+    assert calls[0] is None                 # direct first
+    assert calls[1] == "http://u:p@a:1"      # fell back to proxy on the 5xx
+
+
+def test_fetch_404_is_not_retried_via_proxy(monkeypatch):
+    """A definite 404 is a real result, not a block — the proxy is NOT wasted."""
+    calls = _patch_fetch(monkeypatch, [404], ["http://u:p@a:1"])
+    r, _url, _ms = audit_service._fetch("https://ex.com/")
+    assert r.status_code == 404
+    assert calls == [None]  # only the direct attempt
+
+
+def test_fetch_500_without_proxies_returned_directly(monkeypatch):
+    """With no proxy pool, a 5xx is returned as-is (original behaviour — only a
+    WAF block triggers the direct UA-rotating retry)."""
+    calls = _patch_fetch(monkeypatch, [500], proxies=[])
+    r, _url, _ms = audit_service._fetch("https://ex.com/")
+    assert r.status_code == 500
+    assert calls == [None]
+
+
+def test_fetch_connection_error_falls_back_to_proxy(monkeypatch):
+    """'Page didn't come' (connection error) on the direct hit falls back to the
+    proxy as the second step."""
+    calls = []
+
+    def fake_once(url, headers, proxy=None):
+        calls.append(proxy)
+        if proxy is None:
+            raise audit_service.FetchError("direct did not come")
+        return _Resp(200), url, 1
+
+    monkeypatch.setattr(audit_service, "_fetch_once", fake_once)
+    monkeypatch.setattr(audit_service.time, "sleep", lambda *_: None)
+    monkeypatch.setattr(audit_service.proxy_pool, "shuffled", lambda raw: ["http://u:p@a:1"])
+    r, _url, _ms = audit_service._fetch("https://ex.com/")
+    assert r.status_code == 200
+    assert calls[0] is None                 # direct attempt (errored)
+    assert calls[1] == "http://u:p@a:1"      # fell back to proxy

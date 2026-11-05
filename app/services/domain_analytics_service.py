@@ -96,6 +96,33 @@ def latest(
     return {r.target: r for r in rows}
 
 
+def history(
+    db: Session, targets: list[str], *, location_code: int, language: str,
+    env: str = data_env.LIVE,
+) -> dict[str, list[DomainAnalyticsSnapshot]]:
+    """Every stored snapshot per target in `env`, oldest-first (for trend charts).
+
+    One row per day accumulates (see the table's unique constraint), so a domain
+    refreshed on several days yields a real time series; one refreshed once yields
+    a single point."""
+    if not targets:
+        return {}
+    rows = db.execute(
+        select(DomainAnalyticsSnapshot)
+        .where(
+            DomainAnalyticsSnapshot.environment == env,
+            DomainAnalyticsSnapshot.target.in_(targets),
+            DomainAnalyticsSnapshot.location_code == location_code,
+            DomainAnalyticsSnapshot.language_code == language,
+        )
+        .order_by(DomainAnalyticsSnapshot.target, DomainAnalyticsSnapshot.fetched_on.asc())
+    ).scalars().all()
+    out: dict[str, list[DomainAnalyticsSnapshot]] = {}
+    for r in rows:
+        out.setdefault(r.target, []).append(r)
+    return out
+
+
 def _values(target: str, location_code: int, language: str,
             metrics: dict | None, rank: int | None, env: str,
             links: dict | None = None) -> dict:

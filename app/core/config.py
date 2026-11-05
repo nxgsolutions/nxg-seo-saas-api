@@ -60,29 +60,14 @@ class Settings(BaseSettings):
     # heavily rate-limited without one). Get one at https://developers.google.com/speed/docs/insights/v5/get-started
     PSI_API_KEY: str = ""
 
-    # ── Whole-site scoring ────────────────────────────────────────────────
-    # The SEO Score audits every indexable page (reusing recent page
-    # scores). These bound the work and keep fetching polite so the server's IP
-    # isn't rate-limited/blocked by the target site's firewall.
-    # Hard ceiling on pages scored in one run (protects the server and the
-    # target site from a runaway job on a very large site).
+    # ── SEO (whole-site) score ────────────────────────────────────────────
+    # The SEO Score aggregates the latest per-page scores that Page Discovery
+    # already crawled — it does not fetch pages itself.
+    # Hard ceiling on pages aggregated in one run (bounds work on very large sites).
     DOMAIN_SCORE_MAX_PAGES: int = 2000
     # How often a SEO Score may be refreshed (the one-time + weekly gate).
     # Set to 0 to allow an instant re-run at any time (handy for testing).
     DOMAIN_SCORE_REFRESH_DAYS: int = 7
-    # Reuse a page's stored score if captured within this many days (no re-fetch).
-    # A re-run skips pages already scored this window, so re-runs stay fast and an
-    # interrupted run resumes cheaply. Kept separate from the refresh gate so the
-    # gate can be lowered for testing without forcing a slow full re-fetch.
-    DOMAIN_SCORE_FRESH_DAYS: int = 7
-    # Polite gap between LIVE page fetches (seconds, randomised in this range).
-    # Reused stored scores do no fetch and are not delayed. Raise if the target
-    # site still blocks the crawl.
-    DOMAIN_SCORE_FETCH_DELAY_MIN_S: float = 5.0
-    DOMAIN_SCORE_FETCH_DELAY_MAX_S: float = 10.0
-    # Extra cooldown added before the next fetch after a page comes back blocked
-    # (HTTP 401/403/429/503), to let a rate-limit window clear.
-    DOMAIN_SCORE_BLOCK_COOLDOWN_S: float = 30.0
 
     # Google Search Console OAuth (optional). When client id/secret are unset,
     # the GSC features stay dormant and the UI shows a "connect" prompt.
@@ -169,6 +154,10 @@ class Settings(BaseSettings):
     # When set, AI + API debug blocks are ALSO written (appended) to this file
     # with rotation. Empty = console only. E.g. AI_LOG_FILE=logs/debug.log
     AI_LOG_FILE: str = ""
+    # Dedicated website-fetch log: one line per page fetch (direct vs proxy,
+    # status, URL) written to its OWN rotating file, separate from the app logs,
+    # so proxy usage is easy to track. Empty = disabled. Default: logs/fetch.log.
+    FETCH_LOG_FILE: str = "logs/fetch.log"
     # When true, every API request/response is logged (method, path, query,
     # body in + status, duration, body out) via the "app.api" logger. Bodies are
     # redacted (passwords/tokens) and truncated. Dev-first default; set
@@ -300,6 +289,21 @@ class Settings(BaseSettings):
     # scrape from our own IP. Datacenter proxies are usually blocked/decoyed by
     # search engines — use residential ones for reliable results.
     SERP_PROXIES: str = ""
+
+    # Website-fetch proxies (optional). Same host:port:user:pass[,...] format as
+    # SERP_PROXIES. Used for fetching target WEBSITES (Page Discovery, Content
+    # Optimization, Page Audit, …) when a site's firewall blocks our server IP.
+    # Empty = fetch direct; falls back to SERP_PROXIES so one residential pool can
+    # serve both. Use RESIDENTIAL proxies — datacenter IPs are blocked by the same
+    # bot protection. Provider/API calls (PSI, DataForSEO, GSC, OpenAI) are never
+    # proxied.
+    FETCH_PROXIES: str = ""
+
+    @property
+    def fetch_proxies(self) -> str:
+        """Proxy pool for website fetches — FETCH_PROXIES, or SERP_PROXIES when
+        that's unset (one residential pool can serve both)."""
+        return self.FETCH_PROXIES or self.SERP_PROXIES
 
     # Local AI via Ollama (free, private) — FALLBACK for AI writing when OpenAI
     # isn't configured or fails (openai_ai.write_json). Unreachable = skipped.

@@ -1,29 +1,24 @@
 """Whole-site (domain) SEO score.
 
-Aggregates a domain's per-page overall scores (reused from page_snapshots when
-fresh, otherwise freshly scored) and blends them with site-wide technical
-signals (robots/sitemap/HTTPS/indexable coverage) into one 0-100. Every
-indexable page is scored (bounded by a safety ceiling). The heavy work runs in a
-background job (run_domain_score); the combining logic (aggregate /
+Aggregates the LATEST per-page score for a domain's indexable pages — produced
+by Page Discovery, which crawls each page (through the residential proxy) and
+stores its full score as a PageSnapshot — and blends them with site-wide
+technical signals (robots/sitemap/HTTPS/indexable coverage) into one 0-100. This
+service does NOT fetch pages itself: it reads whatever Discovery last crawled, so
+"Re-score" is an instant recompute of the latest crawl. Fresh page data comes
+from running Page Discovery, not from here. The combining logic (aggregate /
 site_technical_score) is pure and unit-tested.
 
     domain_overall = round(PAGE_W * page_quality_adjusted + SITE_W * site_technical)
-
-Fetching is throttled (a randomised gap between live page fetches, with a longer
-cooldown after a block) so the server's IP isn't rate-limited by the target
-site. A reused stored score does no fetch and is not delayed, so a re-run after
-an interruption resumes cheaply (already-scored pages are skipped).
 """
 
 from __future__ import annotations
 
-import random
-import time
 import uuid
 from datetime import datetime, timedelta, timezone
 from urllib.parse import urlparse
 
-from sqlalchemy import or_, select, update
+from sqlalchemy import func, or_, select, update
 from sqlalchemy.orm import Session
 
 from app.core.config import settings
@@ -32,27 +27,20 @@ from app.models.domain import Domain
 from app.models.domain_score import DomainScore, DomainScoreJob
 from app.models.site_page import PageSnapshot, SitePage
 from app.models.workspace import Workspace
-from app.services import crawl_service, page_discovery_service, page_history_service, page_score_service
-from app.services.audit_service import BlockedUrlError, FetchError, InvalidUrlError
+from app.services import crawl_service, page_discovery_service
 from app.services.page_score_service import CATEGORY_WEIGHTS
 
 # Tunables (settings-backed; see app/core/config.py).
 DOMAIN_SCORE_MAX_PAGES = settings.DOMAIN_SCORE_MAX_PAGES  # safety ceiling per run
 REFRESH_DAYS = settings.DOMAIN_SCORE_REFRESH_DAYS         # weekly refetch gate (0 = run anytime)
-FRESH_DAYS = settings.DOMAIN_SCORE_FRESH_DAYS             # reuse a stored score within this window
 PAGE_W = 0.70                   # weight of aggregated page quality in the domain score
 SITE_W = 0.30                   # weight of site-wide technical signals
 WEAK_THRESHOLD = 50             # a page scoring below this is "weak"
 WEAK_PENALTY = 0.30             # max downward pull when every page is weak
 
-# A legitimately long throttled run can take a while; a 'running' row is only
-# considered dead if its heartbeat (last_progress_at) hasn't moved in this long.
+# Aggregation is fast (no fetching), but a run is still a background job; a
+# 'running' row is considered dead if its heartbeat hasn't moved in this long.
 HEARTBEAT_STALE = timedelta(minutes=20)
-
-# HTTP statuses that mean a firewall/bot-protection blocked us (mirrors
-# audit_service._BLOCK_STATUS). A blocked page is counted as failed, not scored,
-# and triggers a cooldown before the next fetch.
-_BLOCK_STATUS = (401, 403, 429, 503)
 
 # Page importance when averaging (evergreen, high-value pages count for more).
 TYPE_WEIGHT = {"home": 3.0, "content": 2.0, "blog": 2.0, "category": 1.5, "tag": 1.0, "other": 1.0}
@@ -166,51 +154,27 @@ def site_technical_score(crawl_checks: list, summary: dict, https_ok: bool) -> t
     return (round(100 * got / wsum) if wsum else 0), checks
 
 
-# ── Scoring one page (reuse / fetch) ─────────────────────────────────────────
+# ── Reading one page's latest score (no network) ─────────────────────────────
 
-def _reuse_score(db: Session, page: SitePage, fresh_before: datetime) -> dict | None:
-    """A recent stored score for this page, or None if none is fresh enough.
-    Reuse does no network request, so it is not throttled."""
+def _latest_score(db: Session, page: SitePage) -> dict | None:
+    """The page's latest stored score from Page Discovery (or any scorer), with
+    its category breakdown. Prefers the newest PageSnapshot that carries an
+    overall score (any age — we aggregate the latest crawl, never re-fetch); if a
+    page was crawled before snapshots carried the breakdown, falls back to the
+    plain overall number on the page row. None when the page was never scored."""
     snap = db.execute(
         select(PageSnapshot).where(
             PageSnapshot.page_id == page.id,
             PageSnapshot.overall_score.isnot(None),
-            PageSnapshot.captured_at >= fresh_before,
         ).order_by(PageSnapshot.captured_at.desc()).limit(1)
     ).scalar_one_or_none()
-    if snap is None:
-        return None
-    return {"url": page.url, "page_id": str(page.id), "score": snap.overall_score,
-            "page_type": _ptype(page), "categories": snap.category_scores or {}}
-
-
-def _fetch_score(db: Session, workspace: Workspace, page: SitePage) -> dict:
-    """Fetch and score one page live, snapshotting it. Returns the page result,
-    or {"failed": True, "blocked": bool} when it couldn't be read. Core Web
-    Vitals (PSI) is skipped here — it's context only and too slow/heavy in bulk."""
-    try:
-        result = page_score_service.run_page_score(page.url, with_psi=False)
-    except (InvalidUrlError, BlockedUrlError, FetchError):
-        return {"failed": True, "blocked": False}
-    # A block page isn't the real page — don't score or snapshot it (so it isn't
-    # reused and skipped next time); count it as failed and let the caller cool down.
-    if result.status_code in _BLOCK_STATUS:
-        return {"failed": True, "blocked": True}
-
-    checks = [{"id": c["id"], "label": c["label"], "status": c["status"]} for c in result.audit_checks]
-    cats = {c.id: c.score for c in result.categories}
-    try:
-        page_history_service.record(
-            db, workspace, result.final_url, html=result.html, source="score",
-            audit_score=result.audit_score, content_score_value=result.content_score,
-            overall_score=result.overall, category_scores=cats, checks=checks,
-            tech=page_history_service.audit_tech(result.status_code, result.load_time_ms,
-                                                 result.page_size_bytes, result.metrics, checks),
-        )
-    except Exception:  # noqa: BLE001 — history is a side effect, never fail the score
-        db.rollback()
-    return {"url": result.final_url, "page_id": str(page.id), "score": result.overall,
-            "page_type": _ptype(page), "categories": cats}
+    if snap is not None:
+        return {"url": page.url, "page_id": str(page.id), "score": snap.overall_score,
+                "page_type": _ptype(page), "categories": snap.category_scores or {}}
+    if page.latest_audit_score is not None:
+        return {"url": page.url, "page_id": str(page.id), "score": page.latest_audit_score,
+                "page_type": _ptype(page), "categories": {}}
+    return None
 
 
 # ── Background worker ───────────────────────────────────────────────────────
@@ -223,11 +187,10 @@ def _finish_error(db: Session, job: DomainScoreJob, message: str) -> None:
 
 
 def run_domain_score(workspace_id, domain_id, job_id, *, session_factory=None) -> None:
-    """Score a whole site into one DomainScore. Own DB session; never raises
-    (background worker — the request has already returned). Throttles live
-    fetches, updates the job's progress + heartbeat as it goes (so the UI can
-    poll and a long run reads as alive), and resumes cheaply on a re-run because
-    pages scored within the refresh window are reused without a fetch."""
+    """Aggregate a whole site into one DomainScore from the latest page scores
+    Page Discovery already crawled — NO page fetching here. Own DB session; never
+    raises (background worker). Fast: it only reads stored snapshots and the
+    site-wide signals, so a re-run is an instant recompute of the latest crawl."""
     db = (session_factory or SessionLocal)()
     job = None
     try:
@@ -248,37 +211,23 @@ def run_domain_score(workspace_id, domain_id, job_id, *, session_factory=None) -
         job.pages_total = total
         db.commit()
 
-        fresh_before = datetime.now(timezone.utc) - timedelta(days=FRESH_DAYS)
+        # Read each indexable page's latest stored score (no network). Pages
+        # Discovery hasn't scored yet are counted as unscored (pages_failed) so
+        # the UI can prompt a Discovery run; they don't drag the average down.
         results: list[dict] = []
-        failed = 0
-        cooldown = 0.0
+        unscored = 0
         for i, page in enumerate(pages, 1):
-            reuse = _reuse_score(db, page, fresh_before)
-            if reuse is not None:
-                results.append(reuse)
+            r = _latest_score(db, page)
+            if r is not None:
+                results.append(r)
             else:
-                # Be polite: wait a randomised gap (plus any block cooldown) before
-                # a live fetch, so the target site doesn't rate-limit our IP.
-                time.sleep(random.uniform(settings.DOMAIN_SCORE_FETCH_DELAY_MIN_S,
-                                          settings.DOMAIN_SCORE_FETCH_DELAY_MAX_S) + cooldown)
-                cooldown = 0.0
-                r = _fetch_score(db, workspace, page)
-                if r.get("failed"):
-                    failed += 1
-                    if r.get("blocked"):
-                        cooldown = settings.DOMAIN_SCORE_BLOCK_COOLDOWN_S
-                else:
-                    results.append(r)
-
-            job.step, job.step_label = 2, f"Scoring pages ({i}/{total})"
-            job.pages_scored = len(results)
-            job.pages_failed = failed
-            job.last_progress_at = datetime.now(timezone.utc)
-            db.commit()
-            # Stop if a newer run superseded this one (status flipped off 'running').
-            db.refresh(job)
-            if job.status != "running":
-                return
+                unscored += 1
+            if i % 200 == 0 or i == total:
+                job.step, job.step_label = 2, f"Reading page scores ({i}/{total})"
+                job.pages_scored = len(results)
+                job.pages_failed = unscored
+                job.last_progress_at = datetime.now(timezone.utc)
+                db.commit()
 
         job.step, job.step_label = 3, "Checking site-wide signals"
         job.last_progress_at = datetime.now(timezone.utc)
@@ -356,6 +305,16 @@ def latest_score(db: Session, domain: Domain) -> DomainScore | None:
     return db.execute(
         select(DomainScore).where(DomainScore.domain_id == domain.id)
         .order_by(DomainScore.created_at.desc()).limit(1)
+    ).scalar_one_or_none()
+
+
+def last_crawled_at(db: Session, domain: Domain) -> datetime | None:
+    """When Page Discovery last fetched any page of this site — the real
+    freshness of the data the score aggregates (distinct from when the score was
+    last recomputed)."""
+    return db.execute(
+        select(func.max(SitePage.last_checked_at)).where(
+            SitePage.domain_id == domain.id, SitePage.discovery_source.isnot(None))
     ).scalar_one_or_none()
 
 
