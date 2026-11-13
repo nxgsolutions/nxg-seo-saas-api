@@ -14,6 +14,7 @@ from app.schemas.opportunity import (
     TrackKeywordResponse,
     CompetitorAnalyticsResponse,
     CompetitorAnalyticsHistoryResponse,
+    CompetitorGapSummaryResponse,
     CompetitorKeywordsResponse,
     OpportunityChangeResponse,
     OpportunityStrategyResponse,
@@ -162,6 +163,20 @@ def competitor_analytics_history(country: str = _COUNTRY,
     return CompetitorAnalyticsHistoryResponse(
         **opportunity_service.competitor_analytics_history(db, ctx.domain, country=_market(ctx, country))
     )
+
+
+@router.get("/strategy/gap-summary", response_model=CompetitorGapSummaryResponse,
+            summary="Keyword overlap / gap per competitor (stored ranked keywords)")
+def competitor_gap_summary(
+    competitors: str | None = Query(None, description="Comma-separated competitor hosts (default: the SERP footprint)"),
+    country: str = _COUNTRY,
+    ctx: DomainContext = Depends(get_domain_context),
+    db: Session = Depends(get_db),
+) -> CompetitorGapSummaryResponse:
+    comps = ([c.strip() for c in competitors.split(",") if c.strip()] if competitors
+             else [c["domain"] for c in opportunity_service.strategy(db, ctx.domain)["competitors"]])
+    return CompetitorGapSummaryResponse(**ranked_keywords_service.gap_summary(
+        db, ctx.domain, comps, country=_market(ctx, country), language=_language(ctx)))
 
 
 @router.post("/strategy/analytics/refresh", response_model=CompetitorAnalyticsResponse,

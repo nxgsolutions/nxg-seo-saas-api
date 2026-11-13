@@ -212,8 +212,12 @@ class CompetitorAnalyticsResponse(BaseModel):
 
 class AnalyticsHistoryPoint(BaseModel):
     captured_on: date
-    organic_traffic: int
-    ranking_keywords: int
+    # Any of these may be null for a month: a domain can have ranked-keyword
+    # volume stored but no monthly traffic snapshot (or vice versa). Missing
+    # values stay null — never zero-filled.
+    organic_traffic: int | None = None
+    ranking_keywords: int | None = None
+    search_volume: int | None = None
 
 
 class AnalyticsHistorySeries(BaseModel):
@@ -229,6 +233,29 @@ class CompetitorAnalyticsHistoryResponse(BaseModel):
     country: str = "in"
     dates: list[date] = []
     competitors: list[AnalyticsHistorySeries] = []
+
+
+class GapKeyword(BaseModel):
+    keyword: str
+    position: int | None = None      # their rank for this keyword
+    search_volume: int = 0
+    etv: float = 0.0                  # their estimated monthly traffic for it
+
+
+class GapSummaryRow(BaseModel):
+    domain: str
+    has_run: bool                    # False = no stored ranked keywords for this competitor yet
+    overlap: int = 0                 # keywords we both rank for
+    gap: int = 0                     # keywords they rank for and we don't
+    gap_volume: int = 0              # total search volume of the gap (opportunity size)
+    gap_etv: float = 0.0             # total estimated traffic of the gap
+    top_gaps: list[GapKeyword] = []  # biggest gap keywords by volume
+
+
+class CompetitorGapSummaryResponse(BaseModel):
+    """Keyword overlap/gap per competitor, from stored ranked-keyword runs."""
+    has_our_run: bool                # False = our own ranked keywords not fetched yet
+    competitors: list[GapSummaryRow] = []
 
 
 class RankedKeywordRow(BaseModel):

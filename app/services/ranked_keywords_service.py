@@ -153,6 +153,103 @@ def latest_run(
     return None
 
 
+def volume_history(
+    db: Session, targets: list[str], *, location_code: int, language: str, env: str,
+) -> dict[str, list[dict]]:
+    """Monthly total search volume per target, summed over the keywords its most
+    recent ranked-keywords run holds.
+
+    Each ranked keyword carries a `monthly` array ([{year, month, search_volume}])
+    of Google-Ads seasonality; summing across the run's keywords per (year, month)
+    gives the domain's monthly addressable search volume. Read-only — aggregates
+    already-stored rows, no provider call. A target with no stored run is absent.
+
+    The sum covers only the top-N keywords the run stored, so it under-counts very
+    large domains (a documented approximation, not an invented value)."""
+    out: dict[str, list[dict]] = {}
+    for target in dict.fromkeys(norm_host(t) for t in targets if t):
+        run = latest_run(db, target, location_code=location_code, language=language, env=env)
+        if run is None:
+            continue
+        rows = db.execute(
+            text(
+                """
+                SELECT (m->>'year')::int  AS year,
+                       (m->>'month')::int AS month,
+                       SUM((m->>'search_volume')::bigint) AS search_volume
+                FROM domain_ranked_keywords k
+                CROSS JOIN LATERAL jsonb_array_elements(k.monthly) m
+                WHERE k.run_id = :run_id AND (m->>'search_volume') IS NOT NULL
+                GROUP BY 1, 2
+                ORDER BY 1, 2
+                """
+            ),
+            {"run_id": str(run.id)},
+        ).all()
+        months = [
+            {"year": r.year, "month": r.month, "search_volume": int(r.search_volume or 0)}
+            for r in rows if r.year and r.month
+        ]
+        if months:
+            out[target] = months
+    return out
+
+
+def gap_summary(
+    db: Session, domain: Domain, competitors: list[str], *,
+    country: str | None = None, language: str | None = None, top: int = 5,
+) -> dict:
+    """Per-competitor keyword overlap vs gap, from stored ranked runs (DB only).
+
+    overlap  = keywords we BOTH rank for;
+    gap      = keywords THEY rank for and we don't (the opportunity);
+    gap_volume / gap_etv size that opportunity; top_gaps lists the biggest gap
+    keywords by search volume. "We rank" = our own ranked run OR a GSC position
+    (via _our_positions). A competitor with no stored run → has_run=False.
+    Nothing is fetched or invented; results sort biggest-opportunity first."""
+    s = domain_settings.resolve(domain, getattr(domain, "workspace", None))
+    country = country or s.country
+    language = language or s.language
+    env = data_env.env_for_domain(db, domain)
+    loc = domain_analytics_service.location_code_for(country)
+    host = norm_host(domain.domain)
+    our_run = latest_run(db, host, location_code=loc, language=language, env=env)
+    ours = set(_our_positions(db, domain, our_run).keys())  # lowercased keywords
+
+    out: list[dict] = []
+    for comp in dict.fromkeys(norm_host(c) for c in competitors if c):
+        if comp == host:
+            continue
+        run = latest_run(db, comp, location_code=loc, language=language, env=env)
+        if run is None:
+            out.append({"domain": comp, "has_run": False, "overlap": 0, "gap": 0,
+                        "gap_volume": 0, "gap_etv": 0.0, "top_gaps": []})
+            continue
+        rows = db.execute(text(
+            "SELECT keyword, rank_absolute, search_volume, etv "
+            "FROM domain_ranked_keywords WHERE run_id = :rid"
+        ), {"rid": str(run.id)}).all()
+        overlap = gap = gap_volume = 0
+        gap_etv = 0.0
+        gaps: list[dict] = []
+        for r in rows:
+            if r.keyword.lower() in ours:
+                overlap += 1
+            else:
+                gap += 1
+                gap_volume += int(r.search_volume or 0)
+                gap_etv += float(r.etv or 0)
+                gaps.append({"keyword": r.keyword, "position": r.rank_absolute,
+                             "search_volume": int(r.search_volume or 0),
+                             "etv": round(float(r.etv or 0), 1)})
+        gaps.sort(key=lambda g: g["search_volume"], reverse=True)
+        out.append({"domain": comp, "has_run": True, "overlap": overlap, "gap": gap,
+                    "gap_volume": gap_volume, "gap_etv": round(gap_etv, 1),
+                    "top_gaps": gaps[:top]})
+    out.sort(key=lambda c: c["gap_volume"], reverse=True)
+    return {"has_our_run": our_run is not None, "competitors": out}
+
+
 def top_pages(rows: list[dict], limit: int = 25) -> list[dict]:
     """Competitor pages (ranking URLs) grouped from keyword rows: how many
     keywords each page ranks for, best position, and traffic."""

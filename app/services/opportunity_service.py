@@ -19,6 +19,7 @@ from app.services import (
     dataforseo_client,
     domain_analytics_service,
     domain_history_service,
+    ranked_keywords_service,
 )
 
 # Big generic properties that appear in almost every SERP — they are noise, not
@@ -516,14 +517,15 @@ def competitor_analytics_history(
     db: Session, domain: Domain, *, country: str = domain_analytics_service.DEFAULT_COUNTRY,
     language: str = "en",
 ) -> dict:
-    """Per-competitor estimated-traffic and ranking-keyword MONTHLY time series.
+    """Per-competitor MONTHLY time series: estimated traffic + ranking keywords
+    (from `domain_monthly_metrics`, the DataForSEO Labs historical endpoints) and
+    total search volume (summed from each domain's stored ranked keywords).
 
-    Built from `domain_monthly_metrics` (DataForSEO Labs 12-month historical
-    endpoints) for the same domains and market as `competitor_analytics` (our
-    domain + its SERP competitors). Read-only: nothing is estimated. Each stored
-    month becomes one point dated to the first of that month; a month with no
-    stored row is simply omitted (the chart bridges gaps — it never zero-fills).
-    Our own domain is returned first, then competitors strongest-first."""
+    Same domains and market as `competitor_analytics` (our domain + its SERP
+    competitors). Read-only: nothing is estimated. Each stored month becomes one
+    point dated to the first of that month; a metric with no stored value for a
+    month stays null (the chart bridges gaps — it never zero-fills). Our own
+    domain is returned first, then competitors strongest-first."""
     host = _norm_host(domain.domain)
     footprint = {c["domain"]: c for c in strategy(db, domain)["competitors"]}
     targets = [host, *footprint]
@@ -531,25 +533,48 @@ def competitor_analytics_history(
     env = data_env.env_for_domain(db, domain)
     stored = domain_history_service.history(
         db, targets, location_code=loc, language=language, env=env)
+    volume = ranked_keywords_service.volume_history(
+        db, targets, location_code=loc, language=language, env=env)
+
+    # Clamp to the trailing 12-month window (e.g. Dec 2025–Nov 2026) so every tab
+    # shares the same span. Volume (from ranked-keyword seasonality) can reach
+    # further back than the 12-month traffic history; those older months are
+    # dropped so the default range is a clean 12 months, not a ragged union.
+    floor = date.fromisoformat(domain_history_service.date_from())
 
     all_dates: set[date] = set()
     competitors = []
     for t in targets:
-        months = stored.get(t)
-        if not months:
+        months = stored.get(t) or []
+        vmonths = volume.get(t) or []
+        if not months and not vmonths:
             continue
-        points = [{
-            "captured_on": date(m.year, m.month, 1),
-            "organic_traffic": round(m.organic_etv),
-            "ranking_keywords": m.organic_count,
-        } for m in months]
-        all_dates.update(p["captured_on"] for p in points)
+        # Union the two sources on first-of-month date; each metric stays null
+        # where its source has no value for that month.
+        by_date: dict[date, dict] = {}
+        for m in months:
+            d = date(m.year, m.month, 1)
+            if d < floor:
+                continue
+            by_date[d] = {"captured_on": d, "organic_traffic": round(m.organic_etv),
+                          "ranking_keywords": m.organic_count, "search_volume": None}
+        for v in vmonths:
+            d = date(v["year"], v["month"], 1)
+            if d < floor:
+                continue
+            pt = by_date.setdefault(d, {"captured_on": d, "organic_traffic": None,
+                                        "ranking_keywords": None, "search_volume": None})
+            pt["search_volume"] = v["search_volume"]
+        if not by_date:
+            continue
+        points = [by_date[d] for d in sorted(by_date)]
+        all_dates.update(by_date)
         competitors.append({"domain": t, "is_you": t == host, "points": points})
 
-    # Our domain first; competitors strongest (latest traffic) first after it.
-    competitors.sort(key=lambda c: (
-        not c["is_you"],
-        -(c["points"][-1]["organic_traffic"] if c["points"] else 0)))
+    # Our domain first; competitors strongest (peak monthly traffic) first after.
+    def _peak(c: dict) -> int:
+        return max((p["organic_traffic"] or 0 for p in c["points"]), default=0)
+    competitors.sort(key=lambda c: (not c["is_you"], -_peak(c)))
     return {
         "domain": domain.domain,
         "environment": env,
