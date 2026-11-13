@@ -21,6 +21,7 @@ from app.models.opportunity import (
 )
 from app.models.content_optimization import ContentOptimization
 from app.models.domain_analytics import DomainAnalyticsSnapshot
+from app.models.domain_monthly_metrics import DomainMonthlyMetric
 from app.models.domain_score import DomainScore, DomainScoreJob
 from app.models.ranked_keyword import DomainRankedKeyword, DomainRankedKeywordRun
 from app.models.gsc_connection import GscConnection
@@ -75,6 +76,7 @@ __all__ = [
     "Subscription",
     "ContentOptimization",
     "DomainAnalyticsSnapshot",
+    "DomainMonthlyMetric",
     "DomainRankedKeywordRun",
     "DomainRankedKeyword",
     "CompetitorRankSnapshot",

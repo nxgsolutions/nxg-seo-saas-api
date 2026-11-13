@@ -356,6 +356,94 @@ def domain_rank_overview(
     return (items[0].get("metrics") or None) if items else None
 
 
+def historical_bulk_traffic_estimation(
+    targets: list[str], *, location_code: int, language_code: str,
+    date_from: str | None = None, date_to: str | None = None,
+    item_types: list[str] | None = None, env: str | None = None,
+) -> dict[str, list[dict]]:
+    """Monthly organic estimated traffic (ETV) history for up to 1000 domains.
+
+    Endpoint: dataforseo_labs/google/historical_bulk_traffic_estimation/live —
+    ONE call covers every target. Returns
+        {target_lower: [{year, month, etv, count}, ...]}
+    for the `organic` item type only (one entry per month). `date_from`
+    (yyyy-mm-dd, floor 2020-10-01) bounds the window; omitted => previous 12
+    months. Targets missing from the response are absent from the result.
+    """
+    targets = [t for t in targets if t][:1000]
+    if not targets:
+        return {}
+    task: dict = {
+        "targets": targets,
+        "location_code": location_code,
+        "language_code": language_code,
+        "item_types": item_types or ["organic"],
+    }
+    if date_from:
+        task["date_from"] = date_from
+    if date_to:
+        task["date_to"] = date_to
+    result = _post(
+        "/v3/dataforseo_labs/google/historical_bulk_traffic_estimation/live", task, env)
+    items = (result.get("result") or [{}])[0].get("items") or []
+    out: dict[str, list[dict]] = {}
+    for item in items:
+        target = (item.get("target") or "").lower()
+        if not target:
+            continue
+        organic = ((item.get("metrics") or {}).get("organic")) or []
+        out[target] = [
+            {"year": int(m["year"]), "month": int(m["month"]),
+             "etv": _num(m.get("etv")) or 0.0, "count": int(m.get("count") or 0)}
+            for m in organic if m.get("year") and m.get("month")
+        ]
+    return out
+
+
+def historical_rank_overview(
+    target: str, *, location_code: int, language_code: str,
+    date_from: str | None = None, date_to: str | None = None,
+    env: str | None = None,
+) -> list[dict]:
+    """Monthly organic ranking distribution + ETV for ONE domain.
+
+    Endpoint: dataforseo_labs/google/historical_rank_overview/live (single
+    target). Returns
+        [{year, month, etv, count, pos_1, pos_2_3, pos_4_10, pos_11_20,
+          pos_21_30}, ...]
+    one entry per month. ALWAYS pass `date_from` — this endpoint's default
+    window is only the previous 6 months (floor 2020-10-01).
+    """
+    task: dict = {
+        "target": target,
+        "location_code": location_code,
+        "language_code": language_code,
+    }
+    if date_from:
+        task["date_from"] = date_from
+    if date_to:
+        task["date_to"] = date_to
+    result = _post(
+        "/v3/dataforseo_labs/google/historical_rank_overview/live", task, env)
+    items = (result.get("result") or [{}])[0].get("items") or []
+    out: list[dict] = []
+    for it in items:
+        if not it.get("year") or not it.get("month"):
+            continue
+        organic = (it.get("metrics") or {}).get("organic") or {}
+
+        def i(k: str) -> int:
+            return int(organic.get(k) or 0)
+
+        out.append({
+            "year": int(it["year"]), "month": int(it["month"]),
+            "etv": _num(organic.get("etv")) or 0.0, "count": i("count"),
+            "pos_1": i("pos_1"), "pos_2_3": i("pos_2_3"), "pos_4_10": i("pos_4_10"),
+            "pos_11_20": i("pos_11_20"), "pos_21_30": i("pos_21_30"),
+        })
+    return out
+
+
 def account_balance(env: str | None = None) -> float | None:
     """Current account balance in USD (appendix/user_data). None if unavailable.
 

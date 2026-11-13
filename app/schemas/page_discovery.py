@@ -44,6 +44,9 @@ class DiscoveredPageOut(BaseModel):
     latest_audit_score: int | None = None
     word_count: int | None = None
     has_content: bool = False
+    # SEO score of the saved edited content (null = never edited/scored).
+    content_score: int | None = None
+    edited: bool = False
 
 
 class PageContentOut(BaseModel):
@@ -54,8 +57,18 @@ class PageContentOut(BaseModel):
     http_status: int | None = None
     url: str = ""
     cached: bool = False
+    # True when this content is a saved user edit (not the fetched version).
+    edited: bool = False
+    # On-page SEO score of the saved content (set on save; null otherwise).
+    score: int | None = None
     fetched_at: datetime | None = None
     error: str | None = None
+
+
+class SavePageContentRequest(BaseModel):
+    title: str = ""
+    meta: str = ""
+    body_html: str = ""
 
 
 class ContentCheckOut(BaseModel):

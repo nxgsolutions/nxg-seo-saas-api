@@ -5,6 +5,7 @@ be swapped for GSC/Ads/DataForSEO ingestion without changing these signatures.
 
 from __future__ import annotations
 
+import logging
 import re
 from datetime import date
 
@@ -13,7 +14,12 @@ from sqlalchemy.orm import Session
 
 from app.models.domain import Domain
 from app.models.opportunity import OpportunityKeyword, OpportunityPage, OpportunityTrend
-from app.services import data_env, dataforseo_client, domain_analytics_service
+from app.services import (
+    data_env,
+    dataforseo_client,
+    domain_analytics_service,
+    domain_history_service,
+)
 
 # Big generic properties that appear in almost every SERP — they are noise, not
 # SEO competitors. Excluded from competitor analysis (compared www-stripped).
@@ -24,6 +30,9 @@ _GENERIC_DOMAINS = frozenset({
     "amazon.in", "amazon.com", "flipkart.com", "google.com", "play.google.com",
     "apps.apple.com", "books.google.com", "scholar.google.com", "t.me",
 })
+
+
+logger = logging.getLogger(__name__)
 
 
 def _norm_host(host: str) -> str:
@@ -484,7 +493,9 @@ def competitor_analytics(
     for r in rows:
         r["traffic_share"] = (
             round(r["organic_traffic"] / total_traffic * 100, 1) if total_traffic else 0.0)
-    rows.sort(key=lambda r: r["organic_traffic"], reverse=True)
+    # Our own domain first (so it is always in the default compare set and leads
+    # the legend/colors), then competitors strongest-first.
+    rows.sort(key=lambda r: (not r["is_you"], -r["organic_traffic"]))
 
     return {
         "domain": domain.domain,
@@ -505,38 +516,40 @@ def competitor_analytics_history(
     db: Session, domain: Domain, *, country: str = domain_analytics_service.DEFAULT_COUNTRY,
     language: str = "en",
 ) -> dict:
-    """Per-competitor estimated-traffic and ranking-keyword time series.
+    """Per-competitor estimated-traffic and ranking-keyword MONTHLY time series.
 
-    Built from the dated rows in `domain_analytics_snapshots` for the same domains
-    and market as `competitor_analytics` (our domain + its SERP competitors).
-    Read-only: nothing is estimated. A domain stored on only one day yields a
-    single point (the chart needs >= 2 points to draw a line)."""
+    Built from `domain_monthly_metrics` (DataForSEO Labs 12-month historical
+    endpoints) for the same domains and market as `competitor_analytics` (our
+    domain + its SERP competitors). Read-only: nothing is estimated. Each stored
+    month becomes one point dated to the first of that month; a month with no
+    stored row is simply omitted (the chart bridges gaps — it never zero-fills).
+    Our own domain is returned first, then competitors strongest-first."""
     host = _norm_host(domain.domain)
     footprint = {c["domain"]: c for c in strategy(db, domain)["competitors"]}
     targets = [host, *footprint]
     loc = domain_analytics_service.location_code_for(country)
     env = data_env.env_for_domain(db, domain)
-    stored = domain_analytics_service.history(
+    stored = domain_history_service.history(
         db, targets, location_code=loc, language=language, env=env)
 
     all_dates: set[date] = set()
     competitors = []
     for t in targets:
-        snaps = stored.get(t)
-        if not snaps:
+        months = stored.get(t)
+        if not months:
             continue
         points = [{
-            "captured_on": s.fetched_on,
-            "organic_traffic": round(s.organic_etv),
-            "ranking_keywords": s.organic_count,
-        } for s in snaps]
-        all_dates.update(s.fetched_on for s in snaps)
+            "captured_on": date(m.year, m.month, 1),
+            "organic_traffic": round(m.organic_etv),
+            "ranking_keywords": m.organic_count,
+        } for m in months]
+        all_dates.update(p["captured_on"] for p in points)
         competitors.append({"domain": t, "is_you": t == host, "points": points})
 
-    # Strongest (most recent traffic) first, so the chart's top lines are picked.
-    competitors.sort(
-        key=lambda c: c["points"][-1]["organic_traffic"] if c["points"] else 0,
-        reverse=True)
+    # Our domain first; competitors strongest (latest traffic) first after it.
+    competitors.sort(key=lambda c: (
+        not c["is_you"],
+        -(c["points"][-1]["organic_traffic"] if c["points"] else 0)))
     return {
         "domain": domain.domain,
         "environment": env,
@@ -554,10 +567,19 @@ def refresh_competitor_analytics(
     return the fresh `competitor_analytics` payload plus a refresh summary."""
     host = _norm_host(domain.domain)
     targets = [host, *(c["domain"] for c in strategy(db, domain)["competitors"])]
+    loc = domain_analytics_service.location_code_for(country)
+    env = data_env.env_for_domain(db, domain)
     summary = domain_analytics_service.refresh(
-        db, targets, location_code=domain_analytics_service.location_code_for(country),
-        language=language, force=force, env=data_env.env_for_domain(db, domain),
+        db, targets, location_code=loc, language=language, force=force, env=env,
     )
+    # Also populate the 12-month monthly history that feeds the trend graph
+    # (DataForSEO Labs historical endpoints). Best-effort: a failure here must
+    # not fail the whole refresh, which already stored today's snapshot.
+    try:
+        domain_history_service.refresh_monthly(
+            db, targets, location_code=loc, language=language, force=force, env=env)
+    except DataForSeoError as exc:
+        logger.warning("Monthly history refresh failed for %s: %s", domain.domain, exc)
     return {**competitor_analytics(db, domain, country=country, language=language),
             "refresh": summary}
 

@@ -48,6 +48,15 @@ class SitePage(Base):
     # content editor (not during discovery — keeps scans light for large sites).
     content_html: Mapped[str | None] = mapped_column(Text, nullable=True)
     content_fetched_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    # User-saved edits from the content editor (migration 0054). Kept separate
+    # from content_html (the fetched cache) so a live re-fetch never clobbers a
+    # saved edit; the editor reopens this when present. JSON blob, same keys as
+    # content_html (title/meta/body_html/word_count/http_status/url).
+    edited_content_html: Mapped[str | None] = mapped_column(Text, nullable=True)
+    content_edited_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    # On-page SEO score (0-100) of the saved edited content, recomputed on each
+    # save (same deterministic rules as the live editor score). Migration 0055.
+    content_score: Mapped[int | None] = mapped_column(Integer, nullable=True)
     sitemap_lastmod: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     discovered_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     first_seen_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())

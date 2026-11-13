@@ -785,6 +785,18 @@ def fetch_page_content(db, domain: Domain, page_id: str, *, refresh: bool = Fals
     page = get_page(db, domain, page_id)
     if page is None:
         return None
+    # A saved user edit is the canonical version — reopen it (unless the user
+    # explicitly asked to re-fetch the live page). It is never overwritten by a
+    # re-fetch, so edits survive indefinitely.
+    if page.edited_content_html and not refresh:
+        try:
+            data = json.loads(page.edited_content_html)
+            data["cached"] = True
+            data["edited"] = True
+            data["fetched_at"] = page.content_edited_at
+            return data
+        except (ValueError, TypeError):
+            pass  # bad edit blob — fall through to the fetched cache / live fetch
     if page.content_html and not refresh:
         try:
             data = json.loads(page.content_html)
@@ -822,6 +834,52 @@ def fetch_page_content(db, domain: Domain, page_id: str, *, refresh: bool = Fals
     return {**payload, "cached": False, "fetched_at": page.content_fetched_at}
 
 
+def _body_word_count(body_html: str) -> int | None:
+    """Word count of the rendered body text (editor + table agree on this)."""
+    return len(BeautifulSoup(body_html or "", "html.parser").get_text(" ", strip=True).split()) or None
+
+
+def save_page_content(db, domain: Domain, page_id: str, *, title: str, meta: str,
+                      body_html: str) -> dict | None:
+    """Persist a user's edits to one page's content, kept separate from the
+    fetched cache so a later re-fetch never clobbers them. Updates only this
+    page's edited content + its display title/word_count; leaves the fetched
+    cache, URL and SEO/discovery fields untouched. None = page not found."""
+    page = get_page(db, domain, page_id)
+    if page is None:
+        return None
+    body_html = (body_html or "")[:CONTENT_HTML_CAP]
+    word_count = _body_word_count(body_html)
+    # Keep http_status / url from the last fetch so the saved payload stays shaped
+    # like the fetched one (editor seed, Full-audit link, score context).
+    prev: dict = {}
+    source = page.edited_content_html or page.content_html
+    if source:
+        try:
+            prev = json.loads(source)
+        except (ValueError, TypeError):
+            prev = {}
+    payload = {
+        "title": title, "meta": meta, "body_html": body_html,
+        "word_count": word_count,
+        "http_status": prev.get("http_status"),
+        "url": prev.get("url") or page.url,
+    }
+    # Recompute the on-page SEO score of the saved content (same deterministic
+    # rules as the live editor score) and persist it so the saved page carries an
+    # up-to-date score outside the editor (e.g. the discovered-pages list).
+    _facts, _checks, score = content_score.score_fields(
+        title, meta, body_html, payload["url"], "", page_type=page.page_type or "")
+    page.edited_content_html = json.dumps(payload)
+    page.content_edited_at = datetime.now(timezone.utc)
+    page.title = (title or "")[:512]
+    page.word_count = word_count
+    page.content_score = score
+    db.commit()
+    return {**payload, "score": score, "cached": True, "edited": True,
+            "fetched_at": page.content_edited_at}
+
+
 def score_page_content(db, domain: Domain, page_id: str, *, title: str, meta: str,
                        body_html: str, keyword: str = "") -> dict | None:
     """Re-score edited editor fields for one page (deterministic, no AI, no fetch)."""
@@ -845,4 +903,5 @@ def _page_out(p: SitePage) -> dict:
         "indexable": p.indexable, "discovery_source": p.discovery_source,
         "sitemap_lastmod": p.sitemap_lastmod, "latest_audit_score": p.latest_audit_score,
         "word_count": p.word_count, "has_content": p.content_html is not None,
+        "content_score": p.content_score, "edited": p.edited_content_html is not None,
     }

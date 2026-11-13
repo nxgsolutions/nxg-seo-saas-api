@@ -13,6 +13,7 @@ from app.schemas.page_discovery import (
     DiscoveryRunOut,
     PageContentOut,
     PageDiscoverySummary,
+    SavePageContentRequest,
     ScoreContentRequest,
     ScoreContentResult,
 )
@@ -104,6 +105,25 @@ def page_content(
     editor. Served from cache unless `refresh`; first open fetches it live and
     caches it, so large sites with many dynamic pages stay cheap to scan."""
     data = page_discovery_service.fetch_page_content(db, ctx.domain, page_id, refresh=refresh)
+    if data is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Page not found")
+    return PageContentOut(**data)
+
+
+@router.patch("/pages/{page_id}/content", response_model=PageContentOut,
+              summary="Save a page's edited content (persists the user's edits)")
+def save_page_content(
+    page_id: str,
+    payload: SavePageContentRequest,
+    ctx: DomainContext = Depends(get_domain_context),
+    db: Session = Depends(get_db),
+) -> PageContentOut:
+    """Persist the user's edited title / meta / body for one discovered page.
+    Stored separately from the fetched cache, so a later Re-fetch never clobbers
+    it and the editor reopens this saved version. Does not touch the live site."""
+    data = page_discovery_service.save_page_content(
+        db, ctx.domain, page_id, title=payload.title, meta=payload.meta,
+        body_html=payload.body_html)
     if data is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Page not found")
     return PageContentOut(**data)
