@@ -16,6 +16,8 @@ from app.schemas.opportunity import (
     CompetitorAnalyticsHistoryResponse,
     CompetitorGapSummaryResponse,
     CompetitorKeywordsResponse,
+    GapKeywordsResponse,
+    KeywordOverlapResponse,
     OpportunityChangeResponse,
     OpportunityStrategyResponse,
     OpportunityKeywordsResponse,
@@ -177,6 +179,44 @@ def competitor_gap_summary(
              else [c["domain"] for c in opportunity_service.strategy(db, ctx.domain)["competitors"]])
     return CompetitorGapSummaryResponse(**ranked_keywords_service.gap_summary(
         db, ctx.domain, comps, country=_market(ctx, country), language=_language(ctx)))
+
+
+def _gap_competitors(db: Session, ctx: DomainContext, competitors: str | None) -> list[str]:
+    """Explicit comma-separated competitors, else the strategy SERP footprint."""
+    if competitors:
+        return [c.strip() for c in competitors.split(",") if c.strip()]
+    return [c["domain"] for c in opportunity_service.strategy(db, ctx.domain)["competitors"]]
+
+
+@router.get("/strategy/gap-keywords", response_model=GapKeywordsResponse,
+            summary="Keyword-level gap table (missing/weak/shared) from stored ranked keywords")
+def competitor_gap_keywords(
+    competitors: str | None = Query(None, description="Comma-separated competitor hosts (default: the SERP footprint)"),
+    bucket: str = Query("missing", pattern="^(missing|weak|shared)$"),
+    min_volume: int = Query(0, ge=0, description="Minimum monthly search volume"),
+    intent: str = Query("all", max_length=20),
+    country: str = _COUNTRY,
+    listing: PageQuery = Depends(page_query),
+    ctx: DomainContext = Depends(get_domain_context),
+    db: Session = Depends(get_db),
+) -> GapKeywordsResponse:
+    return GapKeywordsResponse(**ranked_keywords_service.gap_keywords(
+        db, ctx.domain, _gap_competitors(db, ctx, competitors),
+        bucket=bucket, min_volume=min_volume, intent=intent,
+        country=_market(ctx, country), language=_language(ctx), listing=listing))
+
+
+@router.get("/strategy/keyword-overlap", response_model=KeywordOverlapResponse,
+            summary="Keyword-set overlap (Venn) for your domain + up to two competitors")
+def competitor_keyword_overlap(
+    competitors: str | None = Query(None, description="Comma-separated competitor hosts (default: the SERP footprint)"),
+    country: str = _COUNTRY,
+    ctx: DomainContext = Depends(get_domain_context),
+    db: Session = Depends(get_db),
+) -> KeywordOverlapResponse:
+    return KeywordOverlapResponse(**ranked_keywords_service.keyword_overlap(
+        db, ctx.domain, _gap_competitors(db, ctx, competitors),
+        country=_market(ctx, country), language=_language(ctx)))
 
 
 @router.post("/strategy/analytics/refresh", response_model=CompetitorAnalyticsResponse,

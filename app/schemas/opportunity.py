@@ -258,6 +258,59 @@ class CompetitorGapSummaryResponse(BaseModel):
     competitors: list[GapSummaryRow] = []
 
 
+class GapColumn(BaseModel):
+    domain: str
+    is_you: bool = False
+    has_run: bool = False            # False = no stored ranked keywords -> blank cells + Fetch
+
+
+class GapKeywordCell(BaseModel):
+    position: int | None = None
+    traffic: float | None = None     # est. monthly traffic this domain gets from the keyword
+
+
+class GapKeywordRow(BaseModel):
+    keyword: str
+    bucket: str                      # "missing" | "weak" | "shared"
+    search_volume: int = 0
+    keyword_difficulty: int | None = None
+    cpc: float | None = None
+    intent: str | None = None
+    serp_features: list[str] = []
+    our_position: int | None = None
+    our_traffic: float | None = None
+    competitors: dict[str, GapKeywordCell] = {}   # competitor host -> its cell
+
+
+class GapKeywordsResponse(BaseModel):
+    """One page of the keyword-level gap table (missing/weak/shared), DB only."""
+    has_our_run: bool
+    bucket: str
+    counts: dict[str, int] = {}      # keyword count per bucket (all pages)
+    columns: list[GapColumn] = []    # column order: your domain first, then competitors
+    rows: list[GapKeywordRow] = []
+    pagination: PageInfo | None = None
+
+
+class GapVennSet(BaseModel):
+    domain: str
+    is_you: bool = False
+    total: int = 0                   # keywords in this domain's set
+
+
+class GapVennOverlap(BaseModel):
+    domains: list[str]               # the two (or three) domains intersected
+    count: int = 0
+
+
+class KeywordOverlapResponse(BaseModel):
+    """Keyword-set overlap for a Venn of your domain + up to two competitors."""
+    has_our_run: bool
+    sets: list[GapVennSet] = []
+    overlaps: list[GapVennOverlap] = []
+    triple: GapVennOverlap | None = None
+
+
 class RankedKeywordRow(BaseModel):
     keyword: str
     position: int | None = None
