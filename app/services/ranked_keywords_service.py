@@ -365,24 +365,69 @@ def gap_keywords(
     db: Session, domain: Domain, competitors: list[str], *,
     bucket: str = "missing", country: str | None = None, language: str | None = None,
     q: str = "", min_volume: int = 0, intent: str = "all",
+    contains: str = "", excludes: str = "", serp_feature: str = "",
+    pos_min: int | None = None, pos_max: int | None = None,
+    kd_min: int | None = None, kd_max: int | None = None,
+    brand: str = "all", brand_term: str = "",
     listing: PageQuery | None = None,
 ) -> dict:
     """Keyword-level gap table: one page of keywords in the selected bucket
     (missing/weak/shared), with our position/traffic and each competitor's, plus
     volume/KD/CPC/intent/SERP-features. DB-only — never fetches. Bucket counts
-    cover every matching keyword so the tabs stay accurate across pages."""
+    cover every matching keyword so the tabs stay accurate across pages.
+
+    Advanced filters (all optional, applied in-memory over the stored rows):
+    keyword `contains` / `excludes`, `serp_feature` presence, our-position range
+    (`pos_min`/`pos_max`), keyword-difficulty range (`kd_min`/`kd_max`), and
+    brand vs non-brand (`brand` = all|brand|non_brand, matched on `brand_term`).
+    The page total reflects these filters; the bucket badge counts stay totals."""
     core = _gap_rows(db, domain, competitors, country=country, language=language)
     bucket = bucket if bucket in GAP_BUCKETS else "missing"
     q = (q or "").strip().lower()
     intent = (intent or "all").strip().lower()
+    contains = (contains or "").strip().lower()
+    excludes = (excludes or "").strip().lower()
+    serp_feature = (serp_feature or "").strip().lower()
+    brand = (brand or "all").strip().lower()
+    brand_term = (brand_term or "").strip().lower()
 
-    rows = [
-        r for r in core["rows"]
-        if r["bucket"] == bucket
-        and (not q or q in r["keyword"].lower())
-        and r["search_volume"] >= min_volume
-        and (intent == "all" or (r["intent"] or "").lower() == intent)
-    ]
+    def _ok(r: dict) -> bool:
+        if r["bucket"] != bucket:
+            return False
+        kw = r["keyword"].lower()
+        if q and q not in kw:
+            return False
+        if r["search_volume"] < min_volume:
+            return False
+        if intent != "all" and (r["intent"] or "").lower() != intent:
+            return False
+        if contains and contains not in kw:
+            return False
+        if excludes and excludes in kw:
+            return False
+        if serp_feature:
+            feats = [str(f).lower() for f in (r.get("serp_features") or [])]
+            if serp_feature not in feats:
+                return False
+        pos = r.get("our_position")
+        if pos_min is not None and (pos is None or pos < pos_min):
+            return False
+        if pos_max is not None and (pos is None or pos > pos_max):
+            return False
+        kd = r.get("keyword_difficulty")
+        if kd_min is not None and (kd is None or kd < kd_min):
+            return False
+        if kd_max is not None and (kd is None or kd > kd_max):
+            return False
+        if brand_term and brand in ("brand", "non_brand"):
+            has_brand = brand_term in kw
+            if brand == "brand" and not has_brand:
+                return False
+            if brand == "non_brand" and has_brand:
+                return False
+        return True
+
+    rows = [r for r in core["rows"] if _ok(r)]
 
     listing = listing or PageQuery(page=1, page_size=25, sort=None, descending=True, q=None)
     sort = listing.sort if listing.sort in _GAP_SORTS else "search_volume"
