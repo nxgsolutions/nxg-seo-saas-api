@@ -23,6 +23,7 @@ from app.api.routes import (
     page_discovery,
     rankings,
     serp,
+    shopify,
     tools,
     workspaces,
 )
@@ -54,3 +55,6 @@ api_router.include_router(ai_overview.router)
 api_router.include_router(backlinks.router)
 api_router.include_router(page_discovery.router)
 api_router.include_router(domain_score.router)
+api_router.include_router(shopify.router)
+api_router.include_router(shopify.public_router)
+api_router.include_router(shopify.editor_router)

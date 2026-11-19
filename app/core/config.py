@@ -83,6 +83,37 @@ class Settings(BaseSettings):
     def gsc_configured(self) -> bool:
         return bool(self.GOOGLE_OAUTH_CLIENT_ID and self.GOOGLE_OAUTH_CLIENT_SECRET)
 
+    # Shopify (optional). A Shopify app (Dev Dashboard) whose client id/secret
+    # are set here lets a workspace connect a store whose domain matches the
+    # workspace domain, import products/pages and publish SEO edits back.
+    # SHOPIFY_SCOPES must match the scopes enabled on the app.
+    SHOPIFY_API_KEY: str = ""
+    SHOPIFY_API_SECRET: str = ""
+    SHOPIFY_SCOPES: str = (
+        "read_products,write_products,"
+        "read_online_store_pages,write_online_store_pages,"
+        "read_content,write_content,"
+        "read_online_store_navigation,write_online_store_navigation"
+    )
+    SHOPIFY_API_VERSION: str = "2026-10"
+    SHOPIFY_REDIRECT_URI: str = "http://localhost:8000/api/integrations/shopify/callback"
+    # Public HTTPS base URL of this API (e.g. an ngrok tunnel) used to subscribe
+    # webhooks. Shopify only delivers to HTTPS, so subscriptions are skipped
+    # while this is empty / not https.
+    SHOPIFY_WEBHOOK_BASE_URL: str = ""
+
+    # Fernet key (urlsafe base64, 32 bytes) used to encrypt third-party OAuth
+    # tokens at rest. Generate: python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
+    TOKEN_ENCRYPTION_KEY: str = ""
+
+    @property
+    def shopify_configured(self) -> bool:
+        return bool(self.SHOPIFY_API_KEY and self.SHOPIFY_API_SECRET and self.TOKEN_ENCRYPTION_KEY)
+
+    @property
+    def shopify_webhooks_enabled(self) -> bool:
+        return self.SHOPIFY_WEBHOOK_BASE_URL.strip().lower().startswith("https://")
+
     # Google Ads Keyword Planner (real search volume, competition, CPC). Free —
     # it's a Google API, not a paid third party — but needs an Ads account.
     # Reuses GOOGLE_OAUTH_CLIENT_ID/SECRET (same OAuth app, `adwords` scope).

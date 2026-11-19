@@ -22,6 +22,7 @@ class IntegrationsStatus(BaseModel):
     ollama_model: str
     anthropic_configured: bool
     stripe_configured: bool
+    shopify_configured: bool = False
 
 
 @router.get("", response_model=IntegrationsStatus, summary="Status of all integrations")
@@ -40,4 +41,5 @@ def get_status(
         ollama_model=settings.OLLAMA_MODEL,
         anthropic_configured=settings.ai_configured,
         stripe_configured=settings.stripe_configured,
+        shopify_configured=settings.shopify_configured,
     )

@@ -630,9 +630,16 @@ def summary(db, domain: Domain) -> dict:
 
 
 def list_pages(db, domain: Domain, *, q: str, page_type: str, status: str, indexable: str,
-               page: int, page_size: int, sort: str | None, descending: bool) -> tuple[list[dict], int]:
+               page: int, page_size: int, sort: str | None, descending: bool,
+               source: str = "all", external_type: str = "all") -> tuple[list[dict], int]:
     """One page of a domain's discovered pages, filtered + sorted in SQL."""
     where = [SitePage.domain_id == domain.id, SitePage.discovery_source.isnot(None)]
+    if source == "shopify":
+        where.append(SitePage.external_source == "shopify")
+    elif source in ("sitemap", "crawl"):
+        where.append(SitePage.discovery_source == source)
+    if external_type in ("product", "page"):
+        where.append(SitePage.external_type == external_type)
     if q:
         like = f"%{q.lower()}%"
         where.append(func.lower(SitePage.url_key).like(like) | func.lower(SitePage.title).like(like))
@@ -785,10 +792,25 @@ def fetch_page_content(db, domain: Domain, page_id: str, *, refresh: bool = Fals
     page = get_page(db, domain, page_id)
     if page is None:
         return None
+    shopify_refreshed = False
+    if page.external_source == "shopify" and refresh:
+        # Shopify-linked pages are re-read from the Admin API, not scraped.
+        from app.services.shopify import sync as shopify_sync
+        from app.services.shopify.errors import ShopifyError
+
+        try:
+            if shopify_sync.refresh_page(db, domain, page) is None:
+                return {"error": "This item no longer exists in Shopify.", "http_status": 410,
+                        "url": page.url, "cached": False}
+        except ShopifyError as exc:
+            return {"error": str(exc) or "Could not read this item from Shopify.",
+                    "http_status": None, "url": page.url, "cached": False}
+        refresh = False
+        shopify_refreshed = True  # show Shopify's live values, not an older saved draft
     # A saved user edit is the canonical version — reopen it (unless the user
     # explicitly asked to re-fetch the live page). It is never overwritten by a
     # re-fetch, so edits survive indefinitely.
-    if page.edited_content_html and not refresh:
+    if page.edited_content_html and not refresh and not shopify_refreshed:
         try:
             data = json.loads(page.edited_content_html)
             data["cached"] = True
@@ -904,4 +926,8 @@ def _page_out(p: SitePage) -> dict:
         "sitemap_lastmod": p.sitemap_lastmod, "latest_audit_score": p.latest_audit_score,
         "word_count": p.word_count, "has_content": p.content_html is not None,
         "content_score": p.content_score, "edited": p.edited_content_html is not None,
+        "external_source": p.external_source, "external_type": p.external_type,
+        "external_id": p.external_id,
+        "external_handle": p.external_handle, "seo_title": p.seo_title,
+        "seo_description": p.seo_description, "published": p.published,
     }

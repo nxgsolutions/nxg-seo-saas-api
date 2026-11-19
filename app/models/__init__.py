@@ -42,6 +42,7 @@ from app.models.keyword_analysis import (
 from app.models.page_audit import PageAudit
 from app.models.site_page import PageSearchDaily, PageSnapshot, SitePage
 from app.models.saved_keyword import SavedKeyword
+from app.models.shopify import ShopifyConnection, ShopifyPushLog, ShopifyWebhookEvent
 from app.models.ranking import RankEntry, TrackedKeyword
 from app.models.refresh_token import RefreshToken
 from app.models.tenant import Tenant, TenantMember
@@ -71,6 +72,9 @@ __all__ = [
     "TrackedKeyword",
     "RankEntry",
     "GscConnection",
+    "ShopifyConnection",
+    "ShopifyWebhookEvent",
+    "ShopifyPushLog",
     "JobRun",
     "Plan",
     "Subscription",

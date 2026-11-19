@@ -58,6 +58,19 @@ class SitePage(Base):
     # save (same deterministic rules as the live editor score). Migration 0055.
     content_score: Mapped[int | None] = mapped_column(Integer, nullable=True)
     sitemap_lastmod: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    # Link to the CMS resource this page came from (migration 0058). Today only
+    # Shopify: external_source='shopify', external_type product|page, external_id
+    # = the Shopify GID. seo_title / seo_description are the store's own values
+    # as last synced; external_meta holds extras (e.g. product images + alt).
+    external_source: Mapped[str | None] = mapped_column(String(20), nullable=True)
+    external_type: Mapped[str | None] = mapped_column(String(20), nullable=True)
+    external_id: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    external_handle: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    external_updated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    external_meta: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
+    seo_title: Mapped[str | None] = mapped_column(Text, nullable=True)
+    seo_description: Mapped[str | None] = mapped_column(Text, nullable=True)
+    published: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
     discovered_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     first_seen_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
     last_checked_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())

@@ -107,6 +107,9 @@ def page_content(
     data = page_discovery_service.fetch_page_content(db, ctx.domain, page_id, refresh=refresh)
     if data is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Page not found")
+    page = page_discovery_service.get_page(db, ctx.domain, page_id)
+    if page is not None:
+        data = {**data, "external_source": page.external_source, "external_type": page.external_type}
     return PageContentOut(**data)
 
 
@@ -152,6 +155,8 @@ def list_pages(
     type: str = Query("all", max_length=20, description="Page type filter"),
     status: str = Query("all", pattern="^(all|ok|error|blocked)$"),
     indexable: str = Query("all", pattern="^(all|yes|no)$"),
+    source: str = Query("all", pattern="^(all|shopify|sitemap|crawl)$"),
+    external_type: str = Query("all", pattern="^(all|product|page)$"),
     listing: PageQuery = Depends(page_query),
     ctx: DomainContext = Depends(get_domain_context),
     db: Session = Depends(get_db),
@@ -159,7 +164,8 @@ def list_pages(
     """sort = url | title | type | status | lastmod | discovered (default: discovered desc)."""
     rows, total = page_discovery_service.list_pages(
         db, ctx.domain, q=listing.search(), page_type=type, status=status, indexable=indexable,
-        page=listing.page, page_size=listing.page_size, sort=listing.sort, descending=listing.descending)
+        page=listing.page, page_size=listing.page_size, sort=listing.sort, descending=listing.descending,
+        source=source, external_type=external_type)
     total_pages = max(1, -(-total // listing.page_size))
     return DiscoveredPageList(
         rows=[DiscoveredPageOut(**r) for r in rows],

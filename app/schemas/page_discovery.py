@@ -47,6 +47,14 @@ class DiscoveredPageOut(BaseModel):
     # SEO score of the saved edited content (null = never edited/scored).
     content_score: int | None = None
     edited: bool = False
+    # Set when the page came from a connected CMS (today: Shopify).
+    external_source: str | None = None  # shopify
+    external_type: str | None = None    # product | page
+    external_id: str | None = None      # Shopify GID
+    external_handle: str | None = None
+    seo_title: str | None = None
+    seo_description: str | None = None
+    published: bool | None = None
 
 
 class PageContentOut(BaseModel):
@@ -63,6 +71,10 @@ class PageContentOut(BaseModel):
     score: int | None = None
     fetched_at: datetime | None = None
     error: str | None = None
+    # Set when the page is linked to a connected store (today: Shopify), so the
+    # editor can offer "Publish to Shopify" instead of copy/paste.
+    external_source: str | None = None
+    external_type: str | None = None
 
 
 class SavePageContentRequest(BaseModel):
