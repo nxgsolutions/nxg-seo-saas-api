@@ -586,12 +586,21 @@ def competitor_analytics_history(
 
 def refresh_competitor_analytics(
     db: Session, domain: Domain, *, country: str = domain_analytics_service.DEFAULT_COUNTRY,
-    language: str = "en", force: bool = False,
+    language: str = "en", force: bool = False, competitors: list[str] | None = None,
 ) -> dict:
     """Fetch stale/missing whole-site metrics from DataForSEO, store them, and
-    return the fresh `competitor_analytics` payload plus a refresh summary."""
+    return the fresh `competitor_analytics` payload plus a refresh summary.
+
+    `competitors`, when given, scopes the fetch to that subset (plus our own
+    domain) instead of the full SERP footprint — used by "Fetch history" to pull
+    only the domains that have no stored history yet. Combined with force=False,
+    domains whose data is already fresh are skipped, so nothing is re-fetched."""
     host = _norm_host(domain.domain)
-    targets = [host, *(c["domain"] for c in strategy(db, domain)["competitors"])]
+    if competitors:
+        subset = [_norm_host(c) for c in competitors if c]
+        targets = list(dict.fromkeys([host, *(c for c in subset if c and c != host)]))
+    else:
+        targets = [host, *(c["domain"] for c in strategy(db, domain)["competitors"])]
     loc = domain_analytics_service.location_code_for(country)
     env = data_env.env_for_domain(db, domain)
     summary = domain_analytics_service.refresh(

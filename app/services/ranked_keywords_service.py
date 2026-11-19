@@ -250,6 +250,254 @@ def gap_summary(
     return {"has_our_run": our_run is not None, "competitors": out}
 
 
+# Opportunity buckets for the keyword-level gap table (our position vs the best
+# competitor position for the same keyword):
+#   missing — we don't rank, >=1 competitor does        -> new content
+#   weak    — we rank but worse than the best competitor -> quick win
+#   shared  — we both rank and we're equal/better        -> defend
+GAP_BUCKETS = ("missing", "weak", "shared")
+_GAP_SORTS = {"search_volume", "keyword_difficulty", "cpc", "keyword", "our_position"}
+
+
+def _gap_rows(
+    db: Session, domain: Domain, competitors: list[str], *,
+    country: str | None, language: str | None,
+) -> dict:
+    """Shared core for gap_keywords: build one row per keyword across the compared
+    competitors (DB only), tagged missing/weak/shared vs our position. Returns the
+    full unfiltered row list plus column metadata; no fetch, nothing invented."""
+    s = domain_settings.resolve(domain, getattr(domain, "workspace", None))
+    country = country or s.country
+    language = language or s.language
+    env = data_env.env_for_domain(db, domain)
+    loc = domain_analytics_service.location_code_for(country)
+    host = norm_host(domain.domain)
+
+    our_run = latest_run(db, host, location_code=loc, language=language, env=env)
+    ours = _our_positions(db, domain, our_run)            # kw.lower() -> {position,...}
+    our_etv: dict[str, float] = {}                        # kw.lower() -> our est. traffic
+    if our_run is not None:
+        for r in db.execute(text(
+            "SELECT keyword, etv FROM domain_ranked_keywords WHERE run_id = :rid"
+        ), {"rid": str(our_run.id)}).all():
+            if r.etv is not None:
+                our_etv[r.keyword.lower()] = round(float(r.etv), 1)
+
+    # Preserve caller order; drop our own host and duplicates.
+    comp_hosts = [c for c in dict.fromkeys(norm_host(c) for c in competitors if c) if c != host]
+    columns = [{"domain": host, "is_you": True, "has_run": our_run is not None}]
+    kmap: dict[str, dict] = {}
+    for comp in comp_hosts:
+        run = latest_run(db, comp, location_code=loc, language=language, env=env)
+        columns.append({"domain": comp, "is_you": False, "has_run": run is not None})
+        if run is None:
+            continue
+        for r in db.execute(text(
+            "SELECT keyword, rank_absolute, search_volume, etv, cpc, keyword_difficulty, "
+            "intent, serp_features FROM domain_ranked_keywords WHERE run_id = :rid"
+        ), {"rid": str(run.id)}).all():
+            kwl = r.keyword.lower()
+            e = kmap.get(kwl)
+            if e is None:
+                e = kmap[kwl] = {
+                    "keyword": r.keyword,
+                    "search_volume": int(r.search_volume or 0),
+                    "keyword_difficulty": r.keyword_difficulty,
+                    "cpc": float(r.cpc) if r.cpc is not None else None,
+                    "intent": r.intent,
+                    "serp_features": list(r.serp_features or []),
+                    "competitors": {},
+                }
+            # Keyword-level metrics are the same across domains; fill any gaps.
+            if not e["search_volume"]:
+                e["search_volume"] = int(r.search_volume or 0)
+            if e["keyword_difficulty"] is None:
+                e["keyword_difficulty"] = r.keyword_difficulty
+            if e["cpc"] is None and r.cpc is not None:
+                e["cpc"] = float(r.cpc)
+            if not e["intent"]:
+                e["intent"] = r.intent
+            if not e["serp_features"] and r.serp_features:
+                e["serp_features"] = list(r.serp_features)
+            e["competitors"][comp] = {
+                "position": r.rank_absolute,
+                "traffic": round(float(r.etv), 1) if r.etv is not None else None,
+            }
+
+    rows: list[dict] = []
+    counts = {b: 0 for b in GAP_BUCKETS}
+    for kwl, e in kmap.items():
+        mine = ours.get(kwl)
+        our_pos = mine["position"] if mine else None
+        comp_positions = [c["position"] for c in e["competitors"].values() if c["position"] is not None]
+        best_comp = min(comp_positions) if comp_positions else None
+        if best_comp is None:
+            # Nobody actually ranks for it in the stored rows — not an opportunity.
+            continue
+        if our_pos is None:
+            bucket = "missing"
+        elif our_pos > best_comp:
+            bucket = "weak"
+        else:
+            bucket = "shared"
+        counts[bucket] += 1
+        rows.append({
+            "keyword": e["keyword"],
+            "bucket": bucket,
+            "search_volume": e["search_volume"],
+            "keyword_difficulty": e["keyword_difficulty"],
+            "cpc": e["cpc"],
+            "intent": e["intent"],
+            "serp_features": e["serp_features"],
+            "our_position": our_pos,
+            "our_traffic": our_etv.get(kwl),
+            "competitors": e["competitors"],
+        })
+    return {
+        "has_our_run": our_run is not None,
+        "columns": columns,
+        "counts": counts,
+        "rows": rows,
+    }
+
+
+def gap_keywords(
+    db: Session, domain: Domain, competitors: list[str], *,
+    bucket: str = "missing", country: str | None = None, language: str | None = None,
+    q: str = "", min_volume: int = 0, intent: str = "all",
+    contains: str = "", excludes: str = "", serp_feature: str = "",
+    pos_min: int | None = None, pos_max: int | None = None,
+    kd_min: int | None = None, kd_max: int | None = None,
+    brand: str = "all", brand_term: str = "",
+    listing: PageQuery | None = None,
+) -> dict:
+    """Keyword-level gap table: one page of keywords in the selected bucket
+    (missing/weak/shared), with our position/traffic and each competitor's, plus
+    volume/KD/CPC/intent/SERP-features. DB-only — never fetches. Bucket counts
+    cover every matching keyword so the tabs stay accurate across pages.
+
+    Advanced filters (all optional, applied in-memory over the stored rows):
+    keyword `contains` / `excludes`, `serp_feature` presence, our-position range
+    (`pos_min`/`pos_max`), keyword-difficulty range (`kd_min`/`kd_max`), and
+    brand vs non-brand (`brand` = all|brand|non_brand, matched on `brand_term`).
+    The page total reflects these filters; the bucket badge counts stay totals."""
+    core = _gap_rows(db, domain, competitors, country=country, language=language)
+    bucket = bucket if bucket in GAP_BUCKETS else "missing"
+    q = (q or "").strip().lower()
+    intent = (intent or "all").strip().lower()
+    contains = (contains or "").strip().lower()
+    excludes = (excludes or "").strip().lower()
+    serp_feature = (serp_feature or "").strip().lower()
+    brand = (brand or "all").strip().lower()
+    brand_term = (brand_term or "").strip().lower()
+
+    def _ok(r: dict) -> bool:
+        if r["bucket"] != bucket:
+            return False
+        kw = r["keyword"].lower()
+        if q and q not in kw:
+            return False
+        if r["search_volume"] < min_volume:
+            return False
+        if intent != "all" and (r["intent"] or "").lower() != intent:
+            return False
+        if contains and contains not in kw:
+            return False
+        if excludes and excludes in kw:
+            return False
+        if serp_feature:
+            feats = [str(f).lower() for f in (r.get("serp_features") or [])]
+            if serp_feature not in feats:
+                return False
+        pos = r.get("our_position")
+        if pos_min is not None and (pos is None or pos < pos_min):
+            return False
+        if pos_max is not None and (pos is None or pos > pos_max):
+            return False
+        kd = r.get("keyword_difficulty")
+        if kd_min is not None and (kd is None or kd < kd_min):
+            return False
+        if kd_max is not None and (kd is None or kd > kd_max):
+            return False
+        if brand_term and brand in ("brand", "non_brand"):
+            has_brand = brand_term in kw
+            if brand == "brand" and not has_brand:
+                return False
+            if brand == "non_brand" and has_brand:
+                return False
+        return True
+
+    rows = [r for r in core["rows"] if _ok(r)]
+
+    listing = listing or PageQuery(page=1, page_size=25, sort=None, descending=True, q=None)
+    sort = listing.sort if listing.sort in _GAP_SORTS else "search_volume"
+    page_rows, page_info = paginate(
+        rows, page=listing.page, page_size=listing.page_size,
+        sort_key=(lambda r: r["keyword"].lower()) if sort == "keyword" else sort,
+        descending=listing.descending)
+    return {
+        "has_our_run": core["has_our_run"],
+        "bucket": bucket,
+        "counts": core["counts"],
+        "columns": core["columns"],
+        "rows": page_rows,
+        "pagination": page_info,
+    }
+
+
+def keyword_overlap(
+    db: Session, domain: Domain, competitors: list[str], *,
+    country: str | None = None, language: str | None = None,
+) -> dict:
+    """Keyword-set overlap for a Venn of our domain + up to two competitors that
+    have a stored run (DB only). Returns each set's size and the pairwise (and
+    triple) intersection counts; the frontend draws the circles."""
+    s = domain_settings.resolve(domain, getattr(domain, "workspace", None))
+    country = country or s.country
+    language = language or s.language
+    env = data_env.env_for_domain(db, domain)
+    loc = domain_analytics_service.location_code_for(country)
+    host = norm_host(domain.domain)
+
+    our_run = latest_run(db, host, location_code=loc, language=language, env=env)
+    our_set = set(_our_positions(db, domain, our_run).keys())  # lowercased keywords
+
+    sets: list[dict] = [{"domain": host, "is_you": True, "keywords": our_set}]
+    for comp in dict.fromkeys(norm_host(c) for c in competitors if c):
+        if comp == host or len(sets) >= 3:
+            continue
+        run = latest_run(db, comp, location_code=loc, language=language, env=env)
+        if run is None:
+            continue
+        kws = {
+            k.lower() for (k,) in db.execute(text(
+                "SELECT keyword FROM domain_ranked_keywords WHERE run_id = :rid"
+            ), {"rid": str(run.id)}).all()
+        }
+        sets.append({"domain": comp, "is_you": False, "keywords": kws})
+
+    overlaps: list[dict] = []
+    for i in range(len(sets)):
+        for j in range(i + 1, len(sets)):
+            overlaps.append({
+                "domains": [sets[i]["domain"], sets[j]["domain"]],
+                "count": len(sets[i]["keywords"] & sets[j]["keywords"]),
+            })
+    triple = None
+    if len(sets) == 3:
+        triple = {
+            "domains": [s["domain"] for s in sets],
+            "count": len(sets[0]["keywords"] & sets[1]["keywords"] & sets[2]["keywords"]),
+        }
+    return {
+        "has_our_run": our_run is not None,
+        "sets": [{"domain": s["domain"], "is_you": s["is_you"], "total": len(s["keywords"])}
+                 for s in sets],
+        "overlaps": overlaps,
+        "triple": triple,
+    }
+
+
 def top_pages(rows: list[dict], limit: int = 25) -> list[dict]:
     """Competitor pages (ranking URLs) grouped from keyword rows: how many
     keywords each page ranks for, best position, and traffic."""

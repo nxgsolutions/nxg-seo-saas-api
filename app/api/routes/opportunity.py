@@ -16,6 +16,8 @@ from app.schemas.opportunity import (
     CompetitorAnalyticsHistoryResponse,
     CompetitorGapSummaryResponse,
     CompetitorKeywordsResponse,
+    GapKeywordsResponse,
+    KeywordOverlapResponse,
     OpportunityChangeResponse,
     OpportunityStrategyResponse,
     OpportunityKeywordsResponse,
@@ -179,18 +181,70 @@ def competitor_gap_summary(
         db, ctx.domain, comps, country=_market(ctx, country), language=_language(ctx)))
 
 
+def _gap_competitors(db: Session, ctx: DomainContext, competitors: str | None) -> list[str]:
+    """Explicit comma-separated competitors, else the strategy SERP footprint."""
+    if competitors:
+        return [c.strip() for c in competitors.split(",") if c.strip()]
+    return [c["domain"] for c in opportunity_service.strategy(db, ctx.domain)["competitors"]]
+
+
+@router.get("/strategy/gap-keywords", response_model=GapKeywordsResponse,
+            summary="Keyword-level gap table (missing/weak/shared) from stored ranked keywords")
+def competitor_gap_keywords(
+    competitors: str | None = Query(None, description="Comma-separated competitor hosts (default: the SERP footprint)"),
+    bucket: str = Query("missing", pattern="^(missing|weak|shared)$"),
+    min_volume: int = Query(0, ge=0, description="Minimum monthly search volume"),
+    intent: str = Query("all", max_length=20),
+    contains: str = Query("", max_length=100, description="Keyword must contain this text"),
+    excludes: str = Query("", max_length=100, description="Keyword must NOT contain this text"),
+    serp_feature: str = Query("", max_length=40, description="Keep keywords whose SERP has this feature"),
+    pos_min: int | None = Query(None, ge=1, description="Our position >= this"),
+    pos_max: int | None = Query(None, ge=1, description="Our position <= this"),
+    kd_min: int | None = Query(None, ge=0, le=100, description="Keyword difficulty >= this"),
+    kd_max: int | None = Query(None, ge=0, le=100, description="Keyword difficulty <= this"),
+    brand: str = Query("all", pattern="^(all|brand|non_brand)$"),
+    brand_term: str = Query("", max_length=60, description="Brand token used to split brand vs non-brand"),
+    country: str = _COUNTRY,
+    listing: PageQuery = Depends(page_query),
+    ctx: DomainContext = Depends(get_domain_context),
+    db: Session = Depends(get_db),
+) -> GapKeywordsResponse:
+    return GapKeywordsResponse(**ranked_keywords_service.gap_keywords(
+        db, ctx.domain, _gap_competitors(db, ctx, competitors),
+        bucket=bucket, min_volume=min_volume, intent=intent,
+        contains=contains, excludes=excludes, serp_feature=serp_feature,
+        pos_min=pos_min, pos_max=pos_max, kd_min=kd_min, kd_max=kd_max,
+        brand=brand, brand_term=brand_term,
+        country=_market(ctx, country), language=_language(ctx), listing=listing))
+
+
+@router.get("/strategy/keyword-overlap", response_model=KeywordOverlapResponse,
+            summary="Keyword-set overlap (Venn) for your domain + up to two competitors")
+def competitor_keyword_overlap(
+    competitors: str | None = Query(None, description="Comma-separated competitor hosts (default: the SERP footprint)"),
+    country: str = _COUNTRY,
+    ctx: DomainContext = Depends(get_domain_context),
+    db: Session = Depends(get_db),
+) -> KeywordOverlapResponse:
+    return KeywordOverlapResponse(**ranked_keywords_service.keyword_overlap(
+        db, ctx.domain, _gap_competitors(db, ctx, competitors),
+        country=_market(ctx, country), language=_language(ctx)))
+
+
 @router.post("/strategy/analytics/refresh", response_model=CompetitorAnalyticsResponse,
              summary="Fetch whole-site competitor metrics from DataForSEO and store them",
              responses={502: {"description": "DataForSEO error / not configured"}})
 def refresh_competitor_analytics(
     country: str = _COUNTRY,
     force: bool = Query(False, description="Re-fetch even if stored data is still fresh"),
+    competitors: str | None = Query(None, description="Comma-separated subset to fetch (default: full SERP footprint). Used to fetch only domains missing history."),
     ctx: DomainContext = Depends(get_domain_context),
     db: Session = Depends(get_db),
 ) -> CompetitorAnalyticsResponse:
+    subset = [c.strip() for c in competitors.split(",") if c.strip()] if competitors else None
     try:
         payload = opportunity_service.refresh_competitor_analytics(
-            db, ctx.domain, country=_market(ctx, country), force=force)
+            db, ctx.domain, country=_market(ctx, country), force=force, competitors=subset)
     except DataForSeoError as exc:
         raise upstream_error(exc) from exc
     return CompetitorAnalyticsResponse(**payload)
