@@ -86,3 +86,23 @@ def delete_category(
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Category not found")
     category_service.delete_category(db, category)
     return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+
+@router.post(
+    "/{category_id}/restore",
+    response_model=CategoryResponse,
+    summary="Restore a soft-deleted category",
+    responses={404: {"description": "Category not found or not deleted"}},
+)
+def restore_category(
+    category_id: str,
+    _user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> CategoryResponse:
+    category = category_service.restore_category(db, category_id)
+    if category is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Category not found or not deleted",
+        )
+    return CategoryResponse.model_validate(category)

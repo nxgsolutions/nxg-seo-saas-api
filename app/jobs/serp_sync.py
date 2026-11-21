@@ -83,6 +83,7 @@ def _priority_candidates(db: Session, domain: Domain, *, limit: int, env: str) -
                EXISTS (
                  SELECT 1 FROM tracked_keywords tk
                  WHERE tk.domain_id = ok.domain_id AND lower(tk.term) = lower(ok.keyword)
+                   AND tk.deleted_at IS NULL
                ) AS is_tracked
         FROM opportunity_keywords ok
         WHERE ok.domain_id = :did

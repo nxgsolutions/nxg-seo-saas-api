@@ -9,9 +9,10 @@ CLI in `app/jobs/__main__.py`:
 Every run is logged in the `job_runs` table.
 """
 
-from app.jobs import gsc_sync, serp_sync
+from app.jobs import gsc_sync, rank_tracking_sync, serp_sync
 
 JOBS = {
     "gsc_sync": gsc_sync.run,
     "serp_sync": serp_sync.run,
+    "rank_tracking_sync": rank_tracking_sync.run,
 }

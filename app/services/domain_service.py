@@ -3,7 +3,7 @@
 import re
 from urllib.parse import urlparse
 
-from sqlalchemy import delete, select, update
+from sqlalchemy import func, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -59,13 +59,26 @@ def create_domain(
     competitor suggestions are niche-scoped from the start."""
     domain = normalize_domain(url)
 
-    exists = db.execute(
-        select(Domain.id).where(
-            Domain.workspace_id == workspace.id, Domain.domain == domain
-        )
-    ).first()
-    if exists:
-        raise DomainAlreadyExistsError(domain)
+    # Look up any existing row for this (workspace, domain) INCLUDING a
+    # soft-deleted one, so re-adding a previously deleted domain reactivates the
+    # same row (keeping its history) instead of hitting uq_workspace_domain.
+    existing = db.execute(
+        select(Domain)
+        .where(Domain.workspace_id == workspace.id, Domain.domain == domain)
+        .execution_options(include_deleted=True)
+    ).scalar_one_or_none()
+    if existing is not None:
+        if existing.deleted_at is None:
+            raise DomainAlreadyExistsError(domain)
+        # Reactivate the tombstoned domain; its keywords, competitors, rankings
+        # and snapshot history were preserved and become visible again.
+        existing.deleted_at = None
+        existing.name = (name or domain)
+        if category_id is not None:
+            existing.category_id = category_id
+        db.commit()
+        db.refresh(existing)
+        return existing
 
     domain = Domain(
         workspace_id=workspace.id,
@@ -207,12 +220,36 @@ def list_domains(db: Session, workspace: Workspace) -> list[Domain]:
 
 
 def delete_domain(db: Session, workspace: Workspace, domain_id: str) -> bool:
-    """Delete a workspace's domain. Its keywords, competitors, rankings, SERP and
-    opportunity rows go with it (every FK to domains is ON DELETE CASCADE, so a
-    SQL DELETE lets Postgres do it). Returns False if it isn't in the workspace."""
+    """Soft-delete a workspace's domain: stamp deleted_at instead of removing it.
+
+    The domain disappears from every list and the domain-resolution gate (so its
+    dashboards 404), but its keywords, competitors, rankings, SERP, opportunity
+    trend, scores and competitor rank history are PRESERVED untouched and can be
+    restored. Returns False if the domain isn't in the (live) workspace."""
     domain = get_domain_in_workspace(db, workspace, domain_id)
     if domain is None:
         return False
-    db.execute(delete(Domain).where(Domain.id == domain.id))
+    domain.deleted_at = func.now()
+    db.commit()
+    return True
+
+
+def restore_domain(db: Session, workspace: Workspace, domain_id: str) -> bool:
+    """Restore a soft-deleted domain (clear deleted_at). Returns False if no such
+    soft-deleted domain exists in the workspace."""
+    import uuid
+
+    try:
+        parsed = uuid.UUID(domain_id)
+    except (ValueError, TypeError):
+        return False
+    domain = db.execute(
+        select(Domain)
+        .where(Domain.id == parsed, Domain.workspace_id == workspace.id)
+        .execution_options(include_deleted=True)
+    ).scalar_one_or_none()
+    if domain is None or domain.deleted_at is None:
+        return False
+    domain.deleted_at = None
     db.commit()
     return True

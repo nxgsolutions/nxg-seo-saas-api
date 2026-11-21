@@ -419,7 +419,7 @@ def keyword_options(db: Session, workspace: Workspace, *, domain_id: str | None,
         """), {"d": str(did), "u": u}).all():
             out.setdefault(r.keyword.lower(), {"keyword": r.keyword, "source": "page",
                                                "search_volume": r.search_volume, "position": r.current_position})
-    for r in db.execute(text("SELECT term FROM tracked_keywords WHERE domain_id = :d ORDER BY created_at DESC LIMIT 15"),
+    for r in db.execute(text("SELECT term FROM tracked_keywords WHERE domain_id = :d AND deleted_at IS NULL ORDER BY created_at DESC LIMIT 15"),
                         {"d": str(did)}).all():
         out.setdefault(r.term.lower(), {"keyword": r.term, "source": "tracked", "search_volume": None, "position": None})
     for r in db.execute(text("""

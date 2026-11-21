@@ -7,6 +7,28 @@ uses are wrapped, and every response is normalized to flat dicts so callers
 never touch DataForSEO's nested envelope.
 
 Docs: https://docs.dataforseo.com/v3/
+
+Sandbox support — adding a NEW endpoint
+---------------------------------------
+Every call must be runnable against the free Sandbox so it can be tested
+without spending or polluting live data. Follow these four steps (see
+app/services/data_env.py and docs/dataforseo_sandbox.md for the full guide):
+
+1. Client: give the new function an `env: str | None = None` keyword and pass
+   it straight through to `_post(...)` (or `_bl(...)`). Host routing is then
+   automatic — do NOT build the URL yourself. For a raw httpx call (see
+   `account_balance`) build the host with `_base_url(env)`.
+2. Service: resolve env ONCE with `data_env.env_for_domain(db, domain)` /
+   `env_for_workspace(ws)` / `env_for_workspace_id(db, id)` and thread it in.
+   Never hard-code "live"/"sandbox".
+3. Storage: if the response is persisted, the table needs an `environment`
+   column — set it = env on write, and filter `environment == env` on EVERY
+   read (sandbox and live rows share the table). Add an Alembic migration.
+4. Jobs: any nightly/background sweep must skip sandbox workspaces
+   (`Workspace.is_sandbox.is_(False)`) so sandbox never auto-spends.
+
+`tests/test_dataforseo_sandbox.py::test_every_endpoint_routes_by_env` checks
+step 1 for the whole client — a new endpoint that forgets `env` fails it.
 """
 
 from __future__ import annotations

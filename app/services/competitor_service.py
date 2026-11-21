@@ -12,7 +12,7 @@ from __future__ import annotations
 
 from datetime import date, datetime, timezone
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.orm import Session
 
@@ -27,6 +27,8 @@ from app.services import (
     domain_analytics_service,
     domain_settings,
     keyword_analysis_service,
+    opportunity_service,
+    sandbox_ai,
 )
 
 # How many top competitors to persist per refresh / return in the trend.
@@ -130,21 +132,28 @@ def add_competitor(
     if host == keyword_analysis_service._norm_host(domain.domain):
         raise CompetitorError("That's your own domain, not a competitor.")
 
+    # include_deleted so a previously removed competitor reactivates (keeping its
+    # rank-snapshot history) instead of hitting uq_tracked_competitor.
     existing = db.execute(
         select(TrackedCompetitor).where(
             TrackedCompetitor.domain_id == domain.id,
             TrackedCompetitor.competitor == host,
-        )
+        ).execution_options(include_deleted=True)
     ).scalars().first()
-    if existing is None:
-        existing = TrackedCompetitor(
-            domain_id=domain.id, competitor=host,
-            label=(label or None), source="manual",
-        )
-        db.add(existing)
+    if existing is None or existing.deleted_at is not None:
+        if existing is None:
+            existing = TrackedCompetitor(
+                domain_id=domain.id, competitor=host,
+                label=(label or None), source="manual",
+            )
+            db.add(existing)
+        else:
+            existing.deleted_at = None  # reactivate the tombstoned competitor
+            if label:
+                existing.label = label
         db.commit()
         db.refresh(existing)
-        # Best-effort: verify the newly added competitor against the cached
+        # Best-effort: verify the (re)added competitor against the cached
         # business profile so it shows a match confidence like the discovered
         # ones (instead of a bare "added by you"). Never blocks the add.
         _verify_manual_add(db, domain, existing)
@@ -176,7 +185,9 @@ def _verify_manual_add(db: Session, domain: Domain, tc: TrackedCompetitor) -> No
     try:
         from app.services import competitor_discovery_service as disc
 
-        res = disc.verify_single(biz, tc.competitor, tc.label)
+        # Sandbox: fixed placeholder score, no model call.
+        res = (sandbox_ai.verify_score() if sandbox_ai.is_sandbox(db, domain)
+               else disc.verify_single(biz, tc.competitor, tc.label))
         if not res:
             return
         tc.match_score = res.get("match_score")
@@ -191,7 +202,8 @@ def _verify_manual_add(db: Session, domain: Domain, tc: TrackedCompetitor) -> No
 
 
 def remove_competitor(db: Session, domain: Domain, competitor_id: str) -> bool:
-    """Remove a curated competitor by id (scoped to the domain)."""
+    """Soft-remove a curated competitor by id (scoped to the domain). Its rank
+    snapshot history in competitor_rank_snapshots is preserved."""
     tc = db.execute(
         select(TrackedCompetitor).where(
             TrackedCompetitor.id == competitor_id,
@@ -200,7 +212,22 @@ def remove_competitor(db: Session, domain: Domain, competitor_id: str) -> bool:
     ).scalars().first()
     if tc is None:
         return False
-    db.delete(tc)
+    tc.deleted_at = func.now()
+    db.commit()
+    return True
+
+
+def restore_competitor(db: Session, domain: Domain, competitor_id: str) -> bool:
+    """Restore a soft-deleted competitor. False if no such deleted row."""
+    tc = db.execute(
+        select(TrackedCompetitor).where(
+            TrackedCompetitor.id == competitor_id,
+            TrackedCompetitor.domain_id == domain.id,
+        ).execution_options(include_deleted=True)
+    ).scalars().first()
+    if tc is None or tc.deleted_at is None:
+        return False
+    tc.deleted_at = None
     db.commit()
     return True
 
@@ -248,64 +275,35 @@ def current_competitors(
     }
 
 
-def get_history(db: Session, domain: Domain, *, top: int = CHART_LIMIT) -> dict:
-    """Per-competitor rank time series for the chart.
+# Supported trend frequencies.
+FREQS = ("daily", "weekly", "monthly")
 
-    Includes the `top` competitors by keyword overlap in the most recent
-    snapshot, with all of their historical points (ascending by date).
+
+def get_history(
+    db: Session,
+    domain: Domain,
+    *,
+    freq: str = "weekly",
+    start: date | None = None,
+    end: date | None = None,
+    top: int = CHART_LIMIT,
+) -> dict:
+    """Per-competitor whole-site analytics over time, for the trend chart.
+
+    Sourced from the MANUALLY-FETCHED competitor analytics snapshots
+    (`domain_analytics_snapshots`, the "All competitor analytics" data) via
+    `opportunity_service.competitor_analytics_timeline` — NOT SERP snapshots. Each
+    `weekly`/`monthly` period keeps that period's latest fetch; periods with no
+    fetch are absent (the chart bridges gaps, never zero-fills). Every point
+    carries estimated traffic, ranking keywords, domain rank and traffic share so
+    the UI can switch metric client-side. Locale follows the domain's market.
     """
-    rows = db.execute(
-        select(CompetitorRankSnapshot)
-        .where(CompetitorRankSnapshot.domain_id == domain.id,
-               CompetitorRankSnapshot.is_simulated.is_(False))  # defensive: skip any legacy demo rows
-        .order_by(
-            CompetitorRankSnapshot.competitor,
-            CompetitorRankSnapshot.captured_on,
-        )
-    ).scalars().all()
-
-    country = rows[0].country_code if rows else "in"
-    language = rows[0].language_code if rows else "en"
-
-    if not rows:
-        return {
-            "domain": domain.domain, "country": country, "language": language,
-            "dates": [], "competitors": [],
-        }
-
-    latest = max(r.captured_on for r in rows)
-    # Rank competitors by their standing in the latest snapshot (overlap desc).
-    latest_rows = [r for r in rows if r.captured_on == latest]
-    latest_rows.sort(key=lambda r: (-r.keywords_shared, r.avg_position))
-    keep = [r.competitor for r in latest_rows[:top]]
-
-    by_comp: dict[str, list[CompetitorRankSnapshot]] = {c: [] for c in keep}
-    dates: set[date] = set()
-    for r in rows:
-        if r.competitor not in by_comp:
-            continue
-        by_comp[r.competitor].append(r)
-        dates.add(r.captured_on)
-
-    series = [
-        {
-            "competitor": comp,
-            "points": [
-                {
-                    "captured_on": p.captured_on,
-                    "avg_position": round(p.avg_position, 1),
-                    "best_position": p.best_position,
-                    "keywords_shared": p.keywords_shared,
-                }
-                for p in pts
-            ],
-        }
-        for comp, pts in by_comp.items()
-    ]
-    return {
-        "domain": domain.domain, "country": country, "language": language,
-        "dates": sorted(dates), "competitors": series,
-    }
+    freq = freq if freq in FREQS else "weekly"
+    settings = domain_settings.resolve(domain, getattr(domain, "workspace", None))
+    return opportunity_service.competitor_analytics_timeline(
+        db, domain, freq=freq, start=start, end=end,
+        country=settings.country, language=settings.language,
+    )
 
 
 def _upsert(db: Session, values: list[dict]) -> None:
@@ -480,11 +478,22 @@ def discover_and_store(
 
     # Three agents: 1) profile this business, 2) propose candidates (+ SERP),
     # 3) profile each candidate's real site and keep the best `limit` matches.
-    result = disc.discover(
-        target, limit=limit, extra_services=extra_services,
-        business=cached, market=market, extra_candidates=extra_candidates,
-        exclude_domains=exclude_domains, progress=progress,
-    )
+    # Sandbox workspaces skip all three and use fixed placeholders (no model call).
+    if sandbox_ai.is_sandbox(db, domain):
+        if progress:
+            try:
+                progress(3, disc.DISCOVERY_STEPS[-1])
+            except Exception:  # noqa: BLE001 - progress must never break discovery
+                pass
+        result = sandbox_ai.discover_result(
+            target, limit=limit, market=market,
+            exclude_domains=exclude_domains, business=cached)
+    else:
+        result = disc.discover(
+            target, limit=limit, extra_services=extra_services,
+            business=cached, market=market, extra_candidates=extra_candidates,
+            exclude_domains=exclude_domains, progress=progress,
+        )
     comps = result["competitors"]
 
     # Persist the (possibly freshly extracted) profile for reuse next time.
@@ -536,10 +545,20 @@ def discover_and_store(
     db.flush()
 
     kept = set(_curated_hosts(db, domain))  # remaining = manual
+    # Hosts that still occupy uq_tracked_competitor in ANY state (including rows
+    # a user soft-deleted): never re-insert these, both to respect the user's
+    # removal and to avoid a unique-constraint violation.
+    occupied = {
+        h for (h,) in db.execute(
+            select(TrackedCompetitor.competitor)
+            .where(TrackedCompetitor.domain_id == domain.id)
+            .execution_options(include_deleted=True)
+        ).all()
+    }
     stored = 0
     for c in comps:
         host = keyword_analysis_service._norm_host(c["domain"])
-        if not host or "." not in host or host in kept:
+        if not host or "." not in host or host in kept or host in occupied:
             continue
         db.add(TrackedCompetitor(
             domain_id=domain.id,
@@ -681,7 +700,9 @@ def refresh_business_profile(
     from app.services import competitor_discovery_service as disc
 
     target = (target_domain or domain.domain).strip()
-    profile = disc.extract_business_profile(target)
+    # Sandbox: fixed placeholder profile, no scrape and no model call.
+    profile = (sandbox_ai.business_profile(target) if sandbox_ai.is_sandbox(db, domain)
+               else disc.extract_business_profile(target))
 
     # Pin the market to the domain's configured country (same rule discovery uses).
     cfg = domain_settings.resolve(domain, getattr(domain, "workspace", None))

@@ -20,7 +20,7 @@ from __future__ import annotations
 
 import logging
 import re
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 
 from sqlalchemy import and_, exists, func, select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
@@ -50,6 +50,7 @@ from app.services import (
     domain_analytics_service,
     domain_settings,
     gsc_service,
+    intent_service,
     keyword_planner_service,
     keyword_scoring,
     keyword_suggest,
@@ -229,6 +230,112 @@ def _upsert_metric_snapshot(
     return metric
 
 
+def business_seeds(domain: Domain) -> tuple[list[str], str | None]:
+    """Business/category seed terms + a representative URL for Google Keyword
+    Planner, so a domain's keyword research is topic-specific instead of a generic
+    expansion of one typed word.
+
+    Built from first-party context we already store: the domain's cached LLM
+    `business_profile` (services) and its auto-derived `topic_terms`.
+
+    ONLY specific MULTI-WORD phrases are used as Planner seeds. The category name
+    ("Education"), the industry label, the brand name, and bare single words
+    ("services", "notes", "civil") are deliberately excluded: Google expands a
+    single generic word into its huge head term (e.g. "notes" -> 5.5M searches)
+    which is irrelevant to the typed query. Multi-word phrases ("upsc civil
+    services", "daily current affairs") stay on-topic. The site URL (returned
+    separately, used as keywordAndUrlSeed) carries the broad business grounding
+    instead. Returns ([], url) when no multi-word context exists — callers then
+    seed Google with just the user's keyword + the URL."""
+    raw: list[str] = []
+    profile = domain.business_profile or {}
+    for svc in (profile.get("services") or [])[:8]:
+        if isinstance(svc, str) and svc.strip():
+            raw.append(svc.strip().lower())
+    for term in (domain.topic_terms or "").split(","):
+        t = term.strip().lower()
+        if t:
+            raw.append(t)
+
+    def _specific(phrase: str) -> bool:
+        words = phrase.split()
+        # Multi-word only, and at least one word must be a real content word
+        # (drops "best sellers", "online store" and other all-chrome phrases).
+        return len(words) >= 2 and any(_meaningful_seed_word(w) for w in words)
+
+    seeds = [s for s in dict.fromkeys(raw) if len(s) >= 3 and _specific(s)][:8]
+    url = f"https://{domain.domain}" if getattr(domain, "domain", None) else None
+    return seeds, url
+
+
+def _planner_idea_terms(
+    seed: str, domain: Domain | None, country: str, language: str
+) -> dict[str, str | None]:
+    """Expand the candidate set with Google Keyword Planner IDEAS seeded from the
+    business/category context (keyword_and_url when a site URL is available), so a
+    domain search surfaces on-topic keywords Google itself suggests — not only the
+    Autocomplete expansion of the seed. Returns {normalized_keyword: concept}.
+    Empty (and silent) when Ads isn't configured, no domain context exists, or the
+    call fails — the run always continues on the free sources."""
+    if domain is None:
+        logger.info(
+            "[kw-research] 3/5 business/category ideas: SKIPPED — no active website, "
+            "so this is a GENERIC keyword search (Google Autocomplete only)"
+        )
+        return {}
+    if not settings.google_ads_configured:
+        logger.info(
+            "[kw-research] 3/5 business/category ideas: SKIPPED — Google Ads not "
+            "configured (Autocomplete only; no Google Ads idea/metric data)"
+        )
+        return {}
+    seeds, url = business_seeds(domain)
+    mode = "keyword_and_url" if url else "keyword"
+    terms = list(dict.fromkeys([seed, *seeds]))
+    logger.info(
+        "[kw-research] 3/5 business/category-AWARE for domain=%s: Google Ads idea seeds=%s "
+        "url=%s mode=%s  (from category + business_profile.services/industry + topic_terms)",
+        domain.domain, terms, url, mode,
+    )
+    if not terms:
+        return {}
+    try:
+        data = keyword_planner_service.generate_ideas(
+            ", ".join(terms),
+            mode=mode,
+            seed_url=url,
+            country=country,
+            language=language,
+            limit=_MAX_CANDIDATES,
+        )
+    except keyword_planner_service.PlannerError as exc:
+        logger.warning("[kw-research] 3/5 Google Ads ideas unavailable: %s", exc)
+        return {}
+    except Exception:  # noqa: BLE001 — ideas are best-effort; never fail the run
+        logger.exception("[kw-research] 3/5 Google Ads ideas failed; continuing without them")
+        return {}
+    raw = {
+        keyword_scoring.normalize_keyword(r["keyword"]): r.get("concept")
+        for r in data.get("rows", []) if r.get("keyword")
+    }
+    # Relevance gate: Google (prompted by the site URL) still volunteers broad
+    # single-word head terms ("notes", "services", "education") that don't match
+    # the typed query. Keep multi-word ideas (specific) and single words that share
+    # a token with the seed; drop lone generic head terms.
+    seed_tokens = set(re.findall(r"[a-z0-9]+", seed.lower()))
+
+    def _relevant(norm_kw: str) -> bool:
+        words = norm_kw.split()
+        return len(words) >= 2 or bool(seed_tokens & set(words))
+
+    out = {k: v for k, v in raw.items() if _relevant(k)}
+    logger.info(
+        "[kw-research] 3/5 Google Ads Keyword Planner IDEAS -> %d relevant keywords "
+        "(dropped %d off-topic head terms)", len(out), len(raw) - len(out),
+    )
+    return out
+
+
 def _planner_keywords(
     keywords: list[str], country: str, language: str
 ) -> dict[str, dict]:
@@ -297,11 +404,23 @@ def run_research(
     db.flush()
 
     seed_norm = keyword_scoring.normalize_keyword(seed)
+    logger.info(
+        "[kw-research] 1/5 START seed=%r country=%s language=%s active_website=%s business_aware=%s",
+        seed, country, language, (domain.domain if domain else None), domain is not None,
+    )
 
     # 1. Gather candidates from all sources.
     gsc_map = _gsc_keywords(db, workspace, domain) if domain else {}  # owned-domain rank
     # Categorized Autocomplete expansion (the Ubersuggest idea tabs).
     idea_buckets = keyword_suggest.ideas(seed, country, language)
+    _ac_total = sum(
+        len(idea_buckets.get(c, []))
+        for c in ("autocomplete", "related", "questions", "prepositions", "comparisons")
+    )
+    logger.info(
+        "[kw-research] 2/5 Google Autocomplete (free, keyless) -> %d ideas; GSC rank rows -> %d",
+        _ac_total, len(gsc_map),
+    )
     question_norms = {
         keyword_scoring.normalize_keyword(q) for q in idea_buckets.get("questions", [])
     }
@@ -324,6 +443,12 @@ def run_research(
             _note(term, category)
     for norm in gsc_map:
         _note(norm, "gsc")
+    # Business/category-specific ideas from Google Keyword Planner (domain searches
+    # only): seeded from the domain's category, services and topic terms (+ its URL)
+    # so results are on-topic, not a generic expansion of the typed seed.
+    planner_concepts = _planner_idea_terms(seed, domain, country, language)
+    for norm in planner_concepts:
+        _note(norm, "keyword_planner")
 
     # Bound the run; seed and GSC keywords are always kept, then autocomplete.
     if len(candidates) > _MAX_CANDIDATES:
@@ -338,11 +463,16 @@ def run_research(
 
     # Fetch EXACT Ads metrics (volume/cpc/competition) for exactly the keywords we
     # will show — so every row gets real numbers, not just seed-expansion overlaps.
+    logger.info(
+        "[kw-research] 4/5 Google Ads metrics (volume/CPC/competition) for %d candidate keywords",
+        len(candidates),
+    )
     planner_map = _planner_keywords(list(candidates.keys()), country, language)
 
     # 2. Persist keywords, provenance and today's metric snapshot.
     scored: list[tuple[float, Keyword]] = []
     keywords_by_norm: dict[str, Keyword] = {}
+    metrics_by_norm: dict[str, KeywordMetric] = {}
     for norm, sources in candidates.items():
         # Prefer real (GSC / Ads) keyword casing when available, else seed casing.
         display = (
@@ -367,7 +497,19 @@ def run_research(
             trend=seed_trend if norm == seed_norm else None,
             planner=planner_map.get(norm),
         )
-        scored.append((float(metric.opportunity_score or 0.0), keyword))
+        metrics_by_norm[norm] = metric
+        # Rank by opportunity BLENDED with relevance to the typed seed, so on-topic
+        # keywords lead and a zero-overlap head term can never top the list (volume
+        # alone used to float generic head terms up). Seed itself is pinned on top.
+        opp = float(metric.opportunity_score or 0.0)
+        rel = float(metric.relevance_score or 0.0) / 100.0  # 0-1 token overlap
+        rank_key = 1e9 if norm == seed_norm else opp * (0.4 + 0.6 * rel)
+        scored.append((rank_key, keyword))
+
+    # 2b. AI batch intent (business/category aware) for the keywords the deterministic
+    # rules left as 'unknown' — one LLM call for the whole residual, so bare product
+    # nouns ("buddha statue for home") get a real intent instead of 'unknown'.
+    _classify_unknown_intents(metrics_by_norm, keywords_by_norm, domain)
 
     # Link mined questions to the seed keyword (relation_type='question') so the
     # Questions panel can be rebuilt from stored data.
@@ -392,6 +534,11 @@ def run_research(
     research.completed_at = datetime.now(timezone.utc)
     db.commit()
     db.refresh(research)
+    logger.info(
+        "[kw-research] 5/5 DONE: %d keywords stored (%d with Google Ads metrics). "
+        "business_aware=%s", len(scored), sum(1 for n in candidates if n in planner_map),
+        domain is not None,
+    )
     return research
 
 
@@ -435,6 +582,12 @@ def snapshot_seed_serp(
         # Upgrade the seed's difficulty from this real SERP (replaces the
         # word-count heuristic with an actual contested-SERP measure).
         _apply_serp_difficulty(
+            db, research.seed_keyword_id, seed, serp,
+            country=country, language=language,
+        )
+        # Refine the seed's intent from the same SERP (+ an AI fallback for the
+        # genuinely ambiguous) — the one keyword that HAS a SERP, off the hot path.
+        _apply_serp_intent(
             db, research.seed_keyword_id, seed, serp,
             country=country, language=language,
         )
@@ -486,6 +639,80 @@ def _apply_serp_difficulty(
     demand = metric.gsc_impressions if metric.gsc_impressions is not None else metric.search_volume
     position = float(metric.gsc_position) if metric.gsc_position is not None else None
     metric.opportunity_score = keyword_scoring.opportunity_score(demand, position, difficulty)
+
+
+def _apply_serp_intent(
+    db: Session, keyword_id, seed: str, serp: list[dict], *, country: str, language: str,
+    category: str | None = None,
+) -> None:
+    """Refine the SEED's intent with the hybrid classifier (rules + this SERP + an
+    AI fallback) and write it onto the latest metric row. Best-effort: only
+    overwrites when the hybrid resolver returns a concrete (non-'unknown') intent,
+    so a weak SERP never erases a good rule-based label. No-op without a metric
+    row. Bulk keywords keep their fast rule-based intent from `_upsert_metric_snapshot`."""
+    try:
+        result = intent_service.resolve(
+            seed, serp_items=serp, category=category, allow_ai=True,
+        )
+    except Exception:  # noqa: BLE001 - intent refinement must never crash the job
+        logger.exception("SERP/AI intent for seed %r failed", seed)
+        return
+    if result.intent == "unknown":
+        return
+    metric = db.execute(
+        select(KeywordMetric)
+        .where(
+            KeywordMetric.keyword_id == keyword_id,
+            KeywordMetric.country_code == country,
+            KeywordMetric.language_code == language,
+            KeywordMetric.search_engine == "google",
+            KeywordMetric.device == "desktop",
+        )
+        .order_by(KeywordMetric.metric_date.desc())
+        .limit(1)
+    ).scalar_one_or_none()
+    if metric is None:
+        return
+    metric.intent = result.intent
+
+
+def _classify_unknown_intents(
+    metrics_by_norm: dict[str, KeywordMetric],
+    keywords_by_norm: dict[str, Keyword],
+    domain: Domain | None,
+) -> None:
+    """Fill in the intent for every keyword the rules left as 'unknown' with ONE
+    business/category-aware AI batch call. In-place on the metric rows; best-effort
+    (no AI provider, or a failure, just leaves them 'unknown'). This is what turns
+    bare product-noun searches from mostly-'unknown' into real intents."""
+    unknown = {
+        norm: keywords_by_norm[norm].keyword
+        for norm, metric in metrics_by_norm.items()
+        if (metric.intent or "unknown") == "unknown" and norm in keywords_by_norm
+    }
+    if not unknown:
+        return
+    category = getattr(getattr(domain, "category", None), "name", None) if domain else None
+    topic = (domain.topic_terms if domain else None) or None
+    logger.info(
+        "[kw-research] 4.5/5 AI intent: classifying %d 'unknown' keywords "
+        "(category=%s, topic=%s)", len(unknown), category, bool(topic),
+    )
+    try:
+        resolved = intent_service.classify_batch(
+            list(unknown.values()), category=category, topic=topic,
+        )
+    except Exception:  # noqa: BLE001 — intent is best-effort; never fail the run
+        logger.exception("[kw-research] 4.5/5 AI intent batch failed; keeping 'unknown'")
+        return
+    for norm, result in resolved.items():
+        metric = metrics_by_norm.get(norm)
+        if metric is not None:
+            metric.intent = result.intent
+    logger.info(
+        "[kw-research] 4.5/5 AI intent resolved %d of %d unknowns",
+        len(resolved), len(unknown),
+    )
 
 
 def _norm_host(value: str) -> str:
@@ -1149,6 +1376,228 @@ def competitor_domains(
         rows = _aggregate(apply_topic=False, category_only=False)
     rows = rows[:limit]
     return {"domain": own, "country": country, "count": len(rows), "rows": rows}
+
+
+# ── Competitor rank TIMELINE (per-period, from dated SERP snapshots) ──────────
+
+_TL_FREQS = ("daily", "weekly", "monthly")
+
+
+def _period_start(d: date, freq: str) -> date:
+    """Period a capture date falls into: daily = the day, weekly = that week's
+    Monday, monthly = the 1st. SERP fetches land on irregular days; bucketing
+    groups them into even periods for a readable trend."""
+    if freq == "monthly":
+        return d.replace(day=1)
+    if freq == "daily":
+        return d
+    return d - timedelta(days=d.weekday())  # weekly → Monday
+
+
+def _next_period(d: date, freq: str) -> date:
+    """The start of the period after `d` (which must already be a period start)."""
+    if freq == "daily":
+        return d + timedelta(days=1)
+    if freq == "weekly":
+        return d + timedelta(days=7)
+    # monthly → first of next month
+    return (d.replace(day=28) + timedelta(days=4)).replace(day=1)
+
+
+def _period_seq(start: date, end: date, freq: str) -> list[date]:
+    """Continuous list of period-start dates spanning [start, end] inclusive, so
+    the chart has a gapless x-axis even where no snapshot exists for a period."""
+    cur = _period_start(start, freq)
+    last = _period_start(end, freq)
+    out: list[date] = []
+    while cur <= last:
+        out.append(cur)
+        cur = _next_period(cur, freq)
+    return out
+
+
+def competitor_rank_timeline(
+    db: Session,
+    domain: Domain,
+    *,
+    freq: str = "weekly",
+    start: date | None = None,
+    end: date | None = None,
+    country: str = "in",
+    language: str = "en",
+    top: int = 8,
+) -> dict:
+    """Per-competitor average SERP rank over time, for a date range + frequency.
+
+    Point-in-time: each period's average uses only that period's SERP snapshots
+    (unlike `competitor_domains`, which blends every date into one number). Built
+    straight from `serp_snapshots.captured_at` + `serp_snapshot_items`, reusing
+    the same competitor filters (own-domain/non-competitor/entertainment
+    exclusions, workspace keyword scope, category + topic narrowing with the same
+    progressive relaxation). Historical snapshot data only — never a live lookup.
+
+    The series is CONTINUOUS across [start, end] at the chosen `freq`
+    ('daily'|'weekly'|'monthly'): every period appears, and a period with no
+    snapshot gets `avg_position = 0` with `has_data = False` (a display zero, not
+    a real rank — never interpolated or carried forward). Each competitor also
+    carries `average_position` computed over the range EXCLUDING missing periods.
+    Competitors = the top `top` by keyword overlap within the range.
+    """
+    freq = freq if freq in _TL_FREQS else "weekly"
+    today = date.today()
+    end_d = end or today
+    start_d = start or (end_d - timedelta(days=27))
+    if start_d > end_d:
+        start_d, end_d = end_d, start_d
+    periods = _period_seq(start_d, end_d, freq)
+    period_set = set(periods)
+    own = _norm_host(domain.domain)
+    topic_regex = domain_settings.resolve(
+        domain, getattr(domain, "workspace", None)
+    ).topic_regex
+
+    def empty() -> dict:
+        # Still return the continuous axis so the UI can draw a flat line at 0.
+        return {
+            "domain": own, "country": country, "language": language,
+            "freq": freq, "start": start_d, "end": end_d,
+            "dates": list(periods), "competitors": [], "has_data": False,
+        }
+
+    base = (
+        select(
+            SerpSnapshotItem.domain,
+            SerpSnapshotItem.rank_absolute,
+            SerpSnapshot.keyword_id,
+            SerpSnapshot.captured_at,
+        )
+        .join(SerpSnapshot, SerpSnapshot.id == SerpSnapshotItem.snapshot_id)
+        .join(Keyword, Keyword.id == SerpSnapshot.keyword_id)
+        .where(
+            SerpSnapshot.environment == data_env.env_for_domain(db, domain),
+            SerpSnapshotItem.type == "organic",
+        )
+    )
+    category_ids: set = set()
+    if domain.workspace_id is not None:
+        owned_ids = _workspace_keyword_ids(db, domain.workspace_id)
+        if not owned_ids:
+            return empty()
+        base = base.where(SerpSnapshot.keyword_id.in_(owned_ids))
+        if domain.category_id is not None:
+            category_ids = _category_keyword_ids(db, domain.workspace_id, domain.category_id)
+
+    # Prefer the domain's resolved locale, but fall back to all locales if it has
+    # no snapshots there — SERP captures aren't always tagged with the exact
+    # market, and an empty trend is worse than a locale-mixed one.
+    locale = (SerpSnapshot.country_code == country, SerpSnapshot.language_code == language)
+
+    def _fetch(with_text: bool) -> list:
+        stmt = base.add_columns(Keyword.keyword) if with_text else base
+        rows = db.execute(stmt.where(*locale)).all()
+        return rows if rows else db.execute(stmt).all()
+
+    rows_db = _fetch(with_text=False)
+    if not rows_db:
+        return empty()
+
+    drop_entertainment = not _is_entertainment_domain(db, domain)
+
+    def _passes(host: str, keyword_id, keyword, *, apply_topic: bool, category_only: bool) -> bool:
+        if not host or host == own:
+            return False
+        if any(bad in host for bad in _NON_COMPETITOR_HOSTS):
+            return False
+        if drop_entertainment and any(bad in host for bad in _ENTERTAINMENT_HOSTS):
+            return False
+        if category_only and keyword_id not in category_ids:
+            return False
+        if apply_topic and not _on_topic(keyword, topic_regex):
+            return False
+        return True
+
+    # Topic filtering needs the keyword text, so fetch it alongside only when
+    # topic_terms are set (most domains have none — avoids a wider row).
+    rows_t = _fetch(with_text=True) if topic_regex is not None else None
+
+    def _collect(apply_topic: bool, category_only: bool) -> dict[str, list[tuple]]:
+        # comp host -> list of (capture_date, position, keyword_id), raw (not yet
+        # bucketed) so the same collection serves any granularity.
+        recs: dict[str, list[tuple]] = {}
+        source = rows_t if (apply_topic and rows_t is not None) else rows_db
+        for row in source:
+            if apply_topic and rows_t is not None:
+                host, position, keyword_id, captured_at, kw = row
+            else:
+                host, position, keyword_id, captured_at = row
+                kw = None
+            cday = captured_at.date()
+            if cday < start_d or cday > end_d:  # outside the selected range
+                continue
+            h = _norm_host(host)
+            if not _passes(h, keyword_id, kw, apply_topic=apply_topic, category_only=category_only):
+                continue
+            recs.setdefault(h, []).append((cday, int(position), keyword_id))
+        return recs
+
+    use_category = bool(category_ids)
+    recs = _collect(apply_topic=bool(topic_regex), category_only=use_category)
+    if not recs and use_category:
+        recs = _collect(apply_topic=bool(topic_regex), category_only=False)
+    if not recs and topic_regex is not None:
+        recs = _collect(apply_topic=False, category_only=False)
+    if not recs:
+        return empty()
+
+    # Keep the top competitors by TOTAL keyword overlap across all periods
+    # (tie-break by average rank). Stable regardless of the chosen bucket, and it
+    # favours broadly-present competitors, which read best as a trend line.
+    def _overlap(records: list[tuple]) -> int:
+        return len({kid for _, _, kid in records})
+
+    def _avg(records: list[tuple]) -> float:
+        return sum(p for _, p, _ in records) / len(records)
+
+    keep = sorted(recs.items(), key=lambda kv: (-_overlap(kv[1]), _avg(kv[1])))[:top]
+
+    # Build a continuous series per competitor: one point per period in the range.
+    # Periods with no snapshot get avg_position 0 + has_data False (a display
+    # zero, never interpolated); the range average excludes those.
+    competitors = []
+    any_data = False
+    for host, records in keep:
+        by_period: dict[date, list[int]] = {}
+        for cday, pos, _ in records:
+            p = _period_start(cday, freq)
+            if p in period_set:
+                by_period.setdefault(p, []).append(pos)
+        points = []
+        measured: list[float] = []
+        for p in periods:
+            positions = by_period.get(p)
+            if positions:
+                avg = round(sum(positions) / len(positions), 1)
+                measured.append(avg)
+                points.append({"captured_on": p, "avg_position": avg, "has_data": True})
+            else:
+                points.append({"captured_on": p, "avg_position": 0, "has_data": False})
+        if measured:
+            any_data = True
+        competitors.append({
+            "competitor": host,
+            # Average over the range, EXCLUDING missing periods (0 if none).
+            "average_position": round(sum(measured) / len(measured), 1) if measured else 0,
+            "points": points,
+        })
+
+    # Order competitors by best (lowest) range average; no-data ones sink last.
+    competitors.sort(key=lambda c: c["average_position"] if c["average_position"] else 1e9)
+
+    return {
+        "domain": own, "country": country, "language": language,
+        "freq": freq, "start": start_d, "end": end_d,
+        "dates": list(periods), "competitors": competitors, "has_data": any_data,
+    }
 
 
 def list_researches(

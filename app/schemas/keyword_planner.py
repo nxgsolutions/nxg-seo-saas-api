@@ -29,6 +29,7 @@ class PlannerRow(BaseModel):
     cpc_high: float | None = None
     intent: str | None = None  # computed
     seo_difficulty: int | None = None  # computed 0-100
+    concept: str | None = None  # Google's own keyword concept/category group
     monthly: list[MonthlyVolume] = []
 
 

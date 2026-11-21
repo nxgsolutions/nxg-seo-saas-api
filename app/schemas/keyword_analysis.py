@@ -12,6 +12,10 @@ class ResearchRequest(BaseModel):
     # static default, so searches run in the right market for any niche/domain.
     country: str | None = Field(default=None, min_length=2, max_length=2)
     language: str | None = Field(default=None, min_length=2, max_length=2)
+    # Optional: the active website. When set on the workspace-scoped keyword search,
+    # the run pulls business/category-specific Keyword Planner ideas for that domain
+    # (and locale defaults from its settings) instead of a generic seed expansion.
+    domain_id: str | None = Field(default=None)
 
 
 class KeywordMetricOut(BaseModel):

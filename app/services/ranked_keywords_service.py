@@ -114,7 +114,7 @@ def allowed_for_domain(db: Session, domain: Domain) -> set[str]:
     its own site and every competitor on its competitor list."""
     hosts = {norm_host(domain.domain)}
     hosts |= {norm_host(c) for c in db.execute(
-        text("SELECT competitor FROM tracked_competitors WHERE domain_id = :d"), {"d": str(domain.id)}).scalars()}
+        text("SELECT competitor FROM tracked_competitors WHERE domain_id = :d AND deleted_at IS NULL"), {"d": str(domain.id)}).scalars()}
     return hosts
 
 
@@ -870,7 +870,7 @@ def options(db: Session, domain: Domain, *,
     loc = domain_analytics_service.location_code_for(country)
     mine = {norm_host(domain.domain), *(norm_host(s) for s in (suggestions or []))}
     mine |= {norm_host(c) for c in db.execute(
-        text("SELECT competitor FROM tracked_competitors WHERE domain_id = :d"), {"d": str(domain.id)}).scalars()}
+        text("SELECT competitor FROM tracked_competitors WHERE domain_id = :d AND deleted_at IS NULL"), {"d": str(domain.id)}).scalars()}
     stored = db.execute(text(
         """
         SELECT DISTINCT ON (target) target, fetched_at, items_count, total_count, cost

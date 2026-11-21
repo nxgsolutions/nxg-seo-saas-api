@@ -15,9 +15,13 @@ set, raises NotConfiguredError so the endpoint can fall back / prompt to connect
 
 from __future__ import annotations
 
+import logging
+
 import httpx
 
 from app.core.config import settings
+
+logger = logging.getLogger(__name__)
 
 _OAUTH_TOKEN_URL = "https://oauth2.googleapis.com/token"
 _TIMEOUT = httpx.Timeout(30.0)
@@ -92,17 +96,45 @@ def _raise_friendly(resp: httpx.Response) -> None:
             "complete brand verification and apply for Basic access in Google Cloud "
             "Console. Ideas, intent and SEO difficulty still work meanwhile."
         )
+    if "unsupported_version" in blob or ("version" in blob and resp.status_code == 400):
+        raise PlannerError(
+            "The Google Ads API version is out of date (Google deprecates versions "
+            "roughly yearly). Update GOOGLE_ADS_API_VERSION to a current version and "
+            "retry — volume, CPC and competition stay blank until it's bumped."
+        )
     raise PlannerError(f"Keyword Planner error ({resp.status_code}): {resp.text[:300]}")
 
 
-def _seed_body(term: str, mode: str) -> dict:
+def _seed_body(term: str, mode: str, url: str | None = None) -> dict:
     if mode == "url":
         return {"urlSeed": {"url": term}}
     if mode == "site":
         return {"siteSeed": {"site": term}}
+    if mode == "keyword_and_url":
+        # Business terms AND a page/site URL together => Google's richest, most
+        # on-topic idea set. Falls back to a plain keyword seed if no URL.
+        keywords = [k.strip() for k in term.split(",") if k.strip()]
+        if url:
+            return {"keywordAndUrlSeed": {"url": url, "keywords": keywords or [term]}}
+        return {"keywordSeed": {"keywords": keywords or [term]}}
     # default: keyword seed (accepts a comma-separated list too)
     keywords = [k.strip() for k in term.split(",") if k.strip()]
     return {"keywordSeed": {"keywords": keywords or [term]}}
+
+
+def _concept_of(annotations: dict) -> str | None:
+    """Google's own category label for a keyword idea (from keywordAnnotation=
+    KEYWORD_CONCEPT), preferring a specific concept group over 'Non-Brands'/'Others'."""
+    concepts = (annotations or {}).get("concepts") or []
+    names = [
+        ((c.get("conceptGroup") or {}).get("name") or c.get("name") or "").strip()
+        for c in concepts
+    ]
+    names = [n for n in names if n]
+    for n in names:
+        if n.lower() not in ("non-brands", "others", "other", "uncategorized"):
+            return n
+    return names[0] if names else None
 
 
 def _ads_url(method: str) -> str:
@@ -149,11 +181,15 @@ def generate_ideas(
     country: str = "us",
     language: str = "en",
     limit: int = 200,
+    seed_url: str | None = None,
 ) -> dict:
     """Raw keyword ideas from Google Ads Keyword Planner.
 
-    `mode`: 'keyword' | 'url' | 'site'. Returns {"configured": True, "rows": [...]}
-    where each row is Google's raw metrics for one keyword idea."""
+    `mode`: 'keyword' | 'url' | 'site' | 'keyword_and_url'. For 'keyword_and_url'
+    pass `seed_url` (a product/category page or site) alongside the comma-separated
+    business/category `term`s — Google then returns the most on-topic ideas.
+    Returns {"configured": True, "rows": [...]} where each row is Google's raw
+    metrics for one keyword idea, plus Google's own `concept` category label."""
     if not settings.google_ads_configured:
         raise NotConfiguredError(
             "Google Ads Keyword Planner is not configured. Set "
@@ -168,9 +204,20 @@ def generate_ideas(
         "geoTargetConstants": [f"geoTargetConstants/{geo}"],
         "language": f"languageConstants/{lang}",
         "keywordPlanNetwork": "GOOGLE_SEARCH",
+        "includeAdultKeywords": False,
+        # Ask Google to tag each idea with its concept/category group.
+        "keywordAnnotation": ["KEYWORD_CONCEPT"],
         "pageSize": min(limit, 1000),
-        **_seed_body(term, mode),
+        **_seed_body(term, mode, seed_url),
     }
+    seed_key = next((k for k in body if k.endswith("Seed")), "keywordSeed")
+    logger.info(
+        "[google-ads] GenerateKeywordIdeas  geo=%s language=%s network=%s  seed=%s=%s  "
+        "includeAdultKeywords=%s keywordAnnotation=%s pageSize=%s",
+        body["geoTargetConstants"], body["language"], body["keywordPlanNetwork"],
+        seed_key, body[seed_key], body["includeAdultKeywords"],
+        body["keywordAnnotation"], body["pageSize"],
+    )
 
     try:
         with httpx.Client(timeout=_TIMEOUT) as client:
@@ -180,10 +227,11 @@ def generate_ideas(
     if resp.status_code != 200:
         _raise_friendly(resp)
 
-    rows = [
-        _metrics_row(item.get("text", ""), item.get("keywordIdeaMetrics") or {})
-        for item in resp.json().get("results", [])[:limit]
-    ]
+    rows = []
+    for item in resp.json().get("results", [])[:limit]:
+        row = _metrics_row(item.get("text", ""), item.get("keywordIdeaMetrics") or {})
+        row["concept"] = _concept_of(item.get("keywordAnnotations") or {})
+        rows.append(row)
     return {
         "configured": True,
         "mode": mode,
@@ -216,6 +264,11 @@ def historical_metrics(
         "language": f"languageConstants/{lang}",
         "keywordPlanNetwork": "GOOGLE_SEARCH",
     }
+    logger.info(
+        "[google-ads] GenerateKeywordHistoricalMetrics  geo=%s language=%s network=%s  "
+        "keywords=%d (exact metrics: volume/CPC/competition)",
+        body["geoTargetConstants"], body["language"], body["keywordPlanNetwork"], len(kws),
+    )
     try:
         with httpx.Client(timeout=_TIMEOUT) as client:
             resp = client.post(url, headers=_ads_headers(), json=body)

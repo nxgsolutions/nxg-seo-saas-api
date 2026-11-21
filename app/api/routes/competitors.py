@@ -8,6 +8,7 @@ keyword reports:
 """
 
 import logging
+from datetime import date
 
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, status
 from sqlalchemy.orm import Session
@@ -111,6 +112,24 @@ def delete_curated(
     if not competitor_service.remove_competitor(db, ctx.domain, competitor_id):
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND, detail="Competitor not found"
+        )
+
+
+@router.post(
+    "/competitors/list/{competitor_id}/restore",
+    status_code=status.HTTP_204_NO_CONTENT,
+    summary="Restore a removed competitor",
+    responses={404: {"description": "Competitor not found or not deleted"}},
+)
+def restore_curated(
+    competitor_id: str,
+    ctx: DomainContext = Depends(get_domain_context),
+    db: Session = Depends(get_db),
+) -> None:
+    if not competitor_service.restore_competitor(db, ctx.domain, competitor_id):
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Competitor not found or not deleted",
         )
 
 
@@ -261,10 +280,17 @@ def tracked(
     responses={404: {"description": "Domain not found"}},
 )
 def history(
+    freq: str = Query("weekly", pattern="^(daily|weekly|monthly)$"),
+    start: date | None = Query(None, description="Range start (YYYY-MM-DD)"),
+    end: date | None = Query(None, description="Range end (YYYY-MM-DD)"),
     ctx: DomainContext = Depends(get_domain_context),
     db: Session = Depends(get_db),
 ) -> CompetitorHistoryResponse:
-    return CompetitorHistoryResponse(**competitor_service.get_history(db, ctx.domain))
+    return CompetitorHistoryResponse(
+        **competitor_service.get_history(
+            db, ctx.domain, freq=freq, start=start, end=end
+        )
+    )
 
 
 @router.post(

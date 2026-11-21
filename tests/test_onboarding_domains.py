@@ -185,26 +185,70 @@ def _add_domain(client: TestClient, wid: str, url: str) -> str:
     return resp.json()["id"]
 
 
-def test_delete_domain_removes_it_and_its_data(client: TestClient, db_session) -> None:
+def test_delete_domain_soft_deletes_and_preserves_data(client: TestClient, db_session) -> None:
     from sqlalchemy import text
 
     _signup(client)
     wid = _default_workspace_id(client)
     keep = _add_domain(client, wid, "keep-site.com")
     gone = _add_domain(client, wid, "gone-site.com")
-    # A child row that must cascade away with the domain.
+    # A child row whose history must be PRESERVED (not cascaded away) on delete.
     assert client.post(
         f"{WORKSPACES_URL}/{wid}/domains/{gone}/competitors/list", json={"domain": "rival.com"}
     ).status_code == 201
 
     assert client.delete(f"{WORKSPACES_URL}/{wid}/domains/{gone}").status_code == 204
 
+    # Hidden from the active list…
     remaining = [d["id"] for d in client.get(f"{WORKSPACES_URL}/{wid}/domains").json()]
     assert remaining == [keep]
+    # …and domain-scoped access now 404s (the resolution gate skips deleted rows).
+    assert client.delete(f"{WORKSPACES_URL}/{wid}/domains/{gone}").status_code == 404
+
+    # The domain row is soft-deleted (deleted_at set), NOT physically removed…
+    row = db_session.execute(
+        text("select deleted_at from domains where id = :d"), {"d": gone}
+    ).first()
+    assert row is not None and row[0] is not None
+    # …and its child data is kept for history / restore.
     left = db_session.execute(
         text("select count(*) from tracked_competitors where domain_id = :d"), {"d": gone}
     ).scalar_one()
-    assert left == 0
+    assert left == 1
+
+
+def test_restore_domain_brings_it_back(client: TestClient) -> None:
+    _signup(client)
+    wid = _default_workspace_id(client)
+    did = _add_domain(client, wid, "restore-me.com")
+    assert client.delete(f"{WORKSPACES_URL}/{wid}/domains/{did}").status_code == 204
+    assert did not in [d["id"] for d in client.get(f"{WORKSPACES_URL}/{wid}/domains").json()]
+
+    assert client.post(f"{WORKSPACES_URL}/{wid}/domains/{did}/restore").status_code == 204
+    assert did in [d["id"] for d in client.get(f"{WORKSPACES_URL}/{wid}/domains").json()]
+    # Restoring a live (non-deleted) domain 404s.
+    assert client.post(f"{WORKSPACES_URL}/{wid}/domains/{did}/restore").status_code == 404
+
+
+def test_re_add_deleted_domain_reactivates_same_row(client: TestClient, db_session) -> None:
+    from sqlalchemy import text
+
+    _signup(client)
+    wid = _default_workspace_id(client)
+    did = _add_domain(client, wid, "reuse.com")
+    assert client.post(
+        f"{WORKSPACES_URL}/{wid}/domains/{did}/competitors/list", json={"domain": "rival.com"}
+    ).status_code == 201
+    assert client.delete(f"{WORKSPACES_URL}/{wid}/domains/{did}").status_code == 204
+
+    # Re-adding the same host reactivates the SAME row (no duplicate / no 409)…
+    re_id = _add_domain(client, wid, "reuse.com")
+    assert re_id == did
+    # …with its preserved competitor still attached.
+    left = db_session.execute(
+        text("select count(*) from tracked_competitors where domain_id = :d"), {"d": did}
+    ).scalar_one()
+    assert left == 1
 
 
 def test_delete_unknown_domain_404(client: TestClient) -> None:

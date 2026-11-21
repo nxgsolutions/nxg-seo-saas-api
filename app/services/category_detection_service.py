@@ -50,7 +50,16 @@ def detect_category(db: Session, domain: Domain) -> Category | None:
         category_service,
         competitor_discovery_service,
         openai_ai,
+        sandbox_ai,
     )
+
+    # Sandbox workspaces never call the model — return a fixed placeholder
+    # category so the flow is exercised without spending tokens.
+    if sandbox_ai.is_sandbox(db, domain):
+        try:
+            return category_service.get_or_create_category(db, sandbox_ai.category_name())
+        except Exception:  # noqa: BLE001 — never let detection break domain creation
+            return None
 
     if not openai_ai.any_available():
         return None

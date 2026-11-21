@@ -12,10 +12,10 @@ from sqlalchemy import DateTime, ForeignKey, String, UniqueConstraint, func, tex
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
-from app.db.base import Base
+from app.db.base import Base, SoftDeleteMixin
 
 
-class SavedKeyword(Base):
+class SavedKeyword(Base, SoftDeleteMixin):
     __tablename__ = "saved_keywords"
     __table_args__ = (
         UniqueConstraint("domain_id", "normalized_keyword", "country_code", name="uq_saved_keyword"),

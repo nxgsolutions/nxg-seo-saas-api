@@ -12,10 +12,10 @@ from sqlalchemy import DateTime, String, UniqueConstraint, func, text
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
-from app.db.base import Base
+from app.db.base import Base, SoftDeleteMixin
 
 
-class Category(Base):
+class Category(Base, SoftDeleteMixin):
     __tablename__ = "categories"
     __table_args__ = (
         UniqueConstraint("name", name="uq_categories_name"),

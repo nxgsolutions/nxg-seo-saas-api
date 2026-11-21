@@ -94,3 +94,13 @@ def remove_keyword(
 ) -> None:
     if not saved_keywords_service.remove(db, ctx.domain, saved_id):
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Saved keyword not found")
+
+
+@router.post("/{saved_id}/restore", status_code=status.HTTP_204_NO_CONTENT, summary="Restore a removed saved keyword")
+def restore_keyword(
+    saved_id: str,
+    ctx: DomainContext = Depends(get_domain_context),
+    db: Session = Depends(get_db),
+) -> None:
+    if not saved_keywords_service.restore(db, ctx.domain, saved_id):
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Saved keyword not found or not deleted")

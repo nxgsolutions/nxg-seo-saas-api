@@ -6,7 +6,7 @@ so a data wipe can never leave the picker empty.
 
 import re
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -38,11 +38,23 @@ def seed_default_categories(db: Session) -> int:
 
     Returns the number inserted. Matched by slug, so existing rows are untouched.
     """
-    existing = {row[0] for row in db.execute(select(Category.slug)).all()}
+    # Include soft-deleted rows so a default that was removed is reactivated
+    # rather than re-inserted (which would trip uq_categories_slug) — keeping the
+    # picker's defaults always present.
+    existing = {
+        c.slug: c
+        for c in db.execute(
+            select(Category).execution_options(include_deleted=True)
+        ).scalars()
+    }
     inserted = 0
     for name in DEFAULT_CATEGORIES:
         slug = slugify(name)
-        if slug in existing:
+        current = existing.get(slug)
+        if current is not None:
+            if current.deleted_at is not None:
+                current.deleted_at = None  # restore a removed default
+                inserted += 1
             continue
         db.add(Category(name=name, slug=slug))
         inserted += 1
@@ -63,7 +75,24 @@ def get_category(db: Session, category_id: str) -> Category | None:
 
 def create_category(db: Session, name: str) -> Category:
     name = name.strip()
-    category = Category(name=name, slug=slugify(name))
+    slug = slugify(name)
+    # Reactivate a soft-deleted category with the same slug instead of hitting
+    # uq_categories_slug; its domain/keyword assignments survived (SET NULL only
+    # fires on hard delete, which no longer happens).
+    existing = db.execute(
+        select(Category)
+        .where(Category.slug == slug)
+        .execution_options(include_deleted=True)
+    ).scalar_one_or_none()
+    if existing is not None:
+        if existing.deleted_at is None:
+            raise CategoryAlreadyExistsError(name)
+        existing.deleted_at = None
+        existing.name = name
+        db.commit()
+        db.refresh(existing)
+        return existing
+    category = Category(name=name, slug=slug)
     db.add(category)
     try:
         db.commit()
@@ -116,6 +145,21 @@ def update_category(db: Session, category: Category, *, name: str) -> Category:
 
 
 def delete_category(db: Session, category: Category) -> None:
-    # FK is ON DELETE SET NULL, so domains/keywords keep working, uncategorized.
-    db.delete(category)
+    """Soft-delete a category. Domains/keywords keep their category_id (the row is
+    preserved); the category just disappears from lists and the picker. Restorable."""
+    category.deleted_at = func.now()
     db.commit()
+
+
+def restore_category(db: Session, category_id: str) -> Category | None:
+    """Restore a soft-deleted category. Returns the row, or None if not found or
+    not deleted."""
+    category = db.get(
+        Category, category_id, execution_options={"include_deleted": True}
+    )
+    if category is None or category.deleted_at is None:
+        return None
+    category.deleted_at = None
+    db.commit()
+    db.refresh(category)
+    return category

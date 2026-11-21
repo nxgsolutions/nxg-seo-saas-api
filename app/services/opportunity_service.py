@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import logging
 import re
-from datetime import date
+from datetime import date, timedelta
 
 from sqlalchemy import bindparam, func, select, text
 from sqlalchemy.orm import Session
@@ -331,7 +331,7 @@ def curated_competitors(db: Session, domain: Domain) -> list[str]:
     `tracked_competitors`), normalized; our own host excluded."""
     host = _norm_host(domain.domain)
     hosts = db.execute(text(
-        "SELECT competitor FROM tracked_competitors WHERE domain_id = :d ORDER BY created_at"
+        "SELECT competitor FROM tracked_competitors WHERE domain_id = :d AND deleted_at IS NULL ORDER BY created_at"
     ), {"d": str(domain.id)}).scalars().all()
     return [h for h in dict.fromkeys(_norm_host(h) for h in hosts) if h and h != host]
 
@@ -581,6 +581,134 @@ def competitor_analytics_history(
         "country": country,
         "dates": sorted(all_dates),
         "competitors": competitors,
+    }
+
+
+_TL_FREQS = ("daily", "weekly", "monthly")
+_TL_MAX_DAYS = 366  # cap the selectable range at ~12 months
+
+
+def _period_start(d: date, freq: str) -> date:
+    """Period a fetch date falls into: daily = the day, weekly = that week's
+    Monday, monthly = the 1st. Analytics are fetched on irregular days; bucketing
+    groups them evenly."""
+    if freq == "monthly":
+        return d.replace(day=1)
+    if freq == "daily":
+        return d
+    return d - timedelta(days=d.weekday())
+
+
+def _next_period(d: date, freq: str) -> date:
+    if freq == "daily":
+        return d + timedelta(days=1)
+    if freq == "weekly":
+        return d + timedelta(days=7)
+    return (d.replace(day=28) + timedelta(days=4)).replace(day=1)
+
+
+def _period_seq(start: date, end: date, freq: str) -> list[date]:
+    """Continuous period-start dates spanning [start, end] inclusive, so the chart
+    x-axis is gapless (periods with no fetch are zero-filled by the caller)."""
+    cur = _period_start(start, freq)
+    last = _period_start(end, freq)
+    out: list[date] = []
+    while cur <= last:
+        out.append(cur)
+        cur = _next_period(cur, freq)
+    return out
+
+
+def competitor_analytics_timeline(
+    db: Session, domain: Domain, *, freq: str = "weekly",
+    start: date | None = None, end: date | None = None,
+    country: str = domain_analytics_service.DEFAULT_COUNTRY, language: str = "en",
+) -> dict:
+    """Per-competitor whole-site analytics over time, from the MANUALLY-FETCHED
+    snapshots in `domain_analytics_snapshots` (the "All competitor analytics"
+    data), bucketed by `daily`/`weekly`/`monthly`.
+
+    Within each period we keep that period's LATEST fetch (no averaging). The
+    series is CONTINUOUS across [start, end]: every period appears and a period
+    with no fetch is zero-filled (0 for each metric — a display value, never a
+    fabricated record). Each point carries every metric (estimated traffic,
+    ranking keywords, domain rank, and traffic share = the target's organic ETV as
+    a % of the footprint's total that period) so the UI can switch metric without
+    refetching. The range is capped at ~12 months. Same domains + market as
+    `competitor_analytics` (our domain + its SERP competitors)."""
+    freq = freq if freq in _TL_FREQS else "weekly"
+    today = date.today()
+    end_d = end or today
+    start_d = start or (end_d - timedelta(days=90))
+    if start_d > end_d:
+        start_d, end_d = end_d, start_d
+    # Cap the selected window at ~12 months.
+    if (end_d - start_d).days > _TL_MAX_DAYS:
+        start_d = end_d - timedelta(days=_TL_MAX_DAYS)
+
+    host = _norm_host(domain.domain)
+    footprint = {c["domain"]: c for c in strategy(db, domain)["competitors"]}
+    targets = [host, *footprint]
+    loc = domain_analytics_service.location_code_for(country)
+    env = data_env.env_for_domain(db, domain)
+    stored = domain_analytics_service.history(
+        db, targets, location_code=loc, language=language, env=env)
+
+    # target -> {period_start: latest snapshot in that period, within range}
+    per_target: dict[str, dict[date, object]] = {}
+    for t in targets:
+        buckets: dict[date, object] = {}
+        for s in stored.get(t) or []:
+            if s.fetched_on < start_d or s.fetched_on > end_d:
+                continue
+            p = _period_start(s.fetched_on, freq)
+            cur = buckets.get(p)
+            if cur is None or s.fetched_on > cur.fetched_on:  # keep the latest fetch
+                buckets[p] = s
+        if buckets:
+            per_target[t] = buckets
+
+    # Continuous period axis across the range; periods with no fetch get 0.
+    periods = _period_seq(start_d, end_d, freq)
+    # Footprint total ETV per period → each target's traffic share.
+    etv_total = {
+        p: sum(b[p].organic_etv for b in per_target.values() if p in b)
+        for p in periods
+    }
+
+    competitors = []
+    for t in targets:
+        buckets = per_target.get(t)
+        if not buckets:  # competitor with no record in range — skip (no all-0 line)
+            continue
+        points = []
+        for p in periods:
+            s = buckets.get(p)
+            if s is None:  # no fetch this period → display 0, never fabricated
+                points.append({
+                    "captured_on": p, "est_traffic": 0, "ranking_keywords": 0,
+                    "domain_rank": 0, "traffic_share": 0.0,
+                })
+                continue
+            tot = etv_total.get(p) or 0
+            points.append({
+                "captured_on": p,
+                "est_traffic": round(s.organic_etv),
+                "ranking_keywords": s.organic_count,
+                "domain_rank": s.domain_rank or 0,
+                "traffic_share": round(s.organic_etv / tot * 100, 1) if tot else 0.0,
+            })
+        competitors.append({"competitor": t, "is_you": t == host, "points": points})
+
+    # Our domain first; competitors by peak traffic after.
+    def _peak(c: dict) -> int:
+        return max((p["est_traffic"] for p in c["points"]), default=0)
+    competitors.sort(key=lambda c: (not c["is_you"], -_peak(c)))
+
+    return {
+        "domain": domain.domain, "country": country, "freq": freq,
+        "start": start_d, "end": end_d, "dates": periods,
+        "competitors": competitors, "has_data": bool(competitors),
     }
 
 

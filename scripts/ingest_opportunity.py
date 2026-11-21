@@ -27,7 +27,7 @@ from sqlalchemy import delete, select
 from app.db.session import SessionLocal
 from app.models.domain import Domain
 from app.models.opportunity import OpportunityKeyword, OpportunityPage
-from app.services import audit_service, dataforseo_client
+from app.services import audit_service, data_env, dataforseo_client
 from app.services.keyword_analysis_service import _upsert_keyword
 
 LOCATION_NAME = "India"
@@ -235,15 +235,16 @@ def main() -> None:
     home = next(iter(crawled), f"https://{host}")
 
     print(f"[2/3] DataForSEO: volume + SERP for {len(KEYWORDS)} keywords ...")
+    env = data_env.default_env()  # live, or sandbox when DATAFORSEO_FORCE_SANDBOX=true
     volumes = dataforseo_client.search_volume(
-        KEYWORDS, location_name=LOCATION_NAME, language_code=LANGUAGE_CODE)
+        KEYWORDS, location_name=LOCATION_NAME, language_code=LANGUAGE_CODE, env=env)
 
     records: list[dict] = []
     extra_pages: dict[str, str] = {}
     for kw in KEYWORDS:
         try:
             snap = dataforseo_client.serp_organic_snapshot(
-                kw, location_name=LOCATION_NAME, language_code=LANGUAGE_CODE, depth=depth)
+                kw, location_name=LOCATION_NAME, language_code=LANGUAGE_CODE, depth=depth, env=env)
         except Exception as exc:  # noqa: BLE001
             print(f"    ! SERP failed for {kw!r}: {exc}", file=sys.stderr)
             continue

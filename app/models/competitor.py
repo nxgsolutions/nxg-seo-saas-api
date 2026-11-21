@@ -25,10 +25,10 @@ from sqlalchemy import (
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
-from app.db.base import Base
+from app.db.base import Base, SoftDeleteMixin
 
 
-class TrackedCompetitor(Base):
+class TrackedCompetitor(Base, SoftDeleteMixin):
     """A user-curated competitor for a domain — the editable source of truth for
     WHO is tracked. Seeded from serp_snapshots (source='auto') on first refresh,
     then the user can add/remove entries (source='manual'). The rank time series

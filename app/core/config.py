@@ -238,6 +238,18 @@ class Settings(BaseSettings):
     # Off: the job exits without calling DataForSEO even if a scheduler runs it.
     # User-clicked SERP fetches are not affected.
     SERP_SYNC_ENABLED: bool = False
+    # Automated rank-tracking SERP fetches (app/jobs/rank_tracking_sync — PAID per
+    # keyword in LIVE workspaces). Off: the scheduler still auto-tracks SANDBOX
+    # keywords (free), but never spends on live workspaces — those require an
+    # explicit user click. Turn on to allow background paid live tracking.
+    RANK_TRACKING_LIVE_ENABLED: bool = False
+    # SERP depth per rank-tracking fetch (top-100 so deep competitors are caught).
+    RANK_TRACKING_DEPTH: int = 100
+    # Reuse a stored SERP snapshot younger than this instead of re-charging, so a
+    # manual "track now" + a scheduled run on the same day don't double-spend.
+    RANK_TRACKING_DEDUP_HOURS: int = 20
+    # Hard cap on keywords fetched per scheduler run (bounds work + spend).
+    RANK_TRACKING_MAX_PER_RUN: int = 50
     DATAFORSEO_BACKLINKS_ROWS: int = 100
     # Competitors compared in one Link Gap (a single domain_intersection request,
     # so more competitors ≈ no extra request cost; provider accepts up to ~20).

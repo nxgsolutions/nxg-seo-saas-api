@@ -68,7 +68,7 @@ def build(db: Session, workspace: Workspace, keyword: str, *, country: str = "in
     snap = serp_scrape_service.latest_snapshot(db, keyword, country=country, language=language, env=env)
 
     ours = {ranked_keywords_service.norm_host(d) for d in db.execute(
-        text("SELECT domain FROM domains WHERE workspace_id = :w"), {"w": str(workspace.id)}).scalars()}
+        text("SELECT domain FROM domains WHERE workspace_id = :w AND deleted_at IS NULL"), {"w": str(workspace.id)}).scalars()}
 
     raw_rows = snap["rows"] if snap else []
     hosts = sorted({ranked_keywords_service.norm_host(r["domain"]) for r in raw_rows if r.get("domain")})

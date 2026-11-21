@@ -53,12 +53,21 @@ def save(db: Session, domain: Domain, keyword: str, *, country: str = "in", lang
     if not norm:
         raise ValueError("Keyword is empty.")
     country, language = (country or "in").lower()[:8], (language or "en").lower()[:10]
+    # Include soft-deleted rows so re-saving a previously removed keyword
+    # reactivates the same row instead of hitting uq_saved_keyword.
     existing = db.execute(select(SavedKeyword).where(
         SavedKeyword.domain_id == domain.id, SavedKeyword.normalized_keyword == norm,
-        SavedKeyword.country_code == country)).scalar_one_or_none()
+        SavedKeyword.country_code == country).execution_options(include_deleted=True)).scalar_one_or_none()
     if existing is not None:
-        return existing, False
-    count = db.execute(text("SELECT count(*) FROM saved_keywords WHERE domain_id = :d"), {"d": str(domain.id)}).scalar_one()
+        if existing.deleted_at is None:
+            return existing, False
+        existing.deleted_at = None
+        if source:
+            existing.source = source[:40]
+        db.commit()
+        db.refresh(existing)
+        return existing, True
+    count = db.execute(text("SELECT count(*) FROM saved_keywords WHERE domain_id = :d AND deleted_at IS NULL"), {"d": str(domain.id)}).scalar_one()
     if count >= MAX_PER_WEBSITE:
         raise ValueError(f"My Keywords is full ({MAX_PER_WEBSITE:,} keywords). Remove some first.")
     keyword_id = _canonical_keyword_id(db, kw, norm)
@@ -70,7 +79,7 @@ def save(db: Session, domain: Domain, keyword: str, *, country: str = "in", lang
     if row is None:  # saved concurrently
         row = db.execute(select(SavedKeyword).where(
             SavedKeyword.domain_id == domain.id, SavedKeyword.normalized_keyword == norm,
-            SavedKeyword.country_code == country)).scalar_one()
+            SavedKeyword.country_code == country).execution_options(include_deleted=True)).scalar_one()
         return row, False
     return row, True
 
@@ -84,7 +93,23 @@ def remove(db: Session, domain: Domain, saved_id: str) -> bool:
                      ).scalar_one_or_none()
     if row is None:
         return False
-    db.delete(row)
+    row.deleted_at = func.now()  # soft delete; the row is preserved
+    db.commit()
+    return True
+
+
+def restore(db: Session, domain: Domain, saved_id: str) -> bool:
+    """Restore a soft-deleted saved keyword. False if no such deleted row."""
+    try:
+        sid = uuid.UUID(saved_id)
+    except ValueError:
+        return False
+    row = db.execute(select(SavedKeyword).where(
+        SavedKeyword.id == sid, SavedKeyword.domain_id == domain.id
+    ).execution_options(include_deleted=True)).scalar_one_or_none()
+    if row is None or row.deleted_at is None:
+        return False
+    row.deleted_at = None
     db.commit()
     return True
 
@@ -98,7 +123,7 @@ def list_saved(db: Session, domain: Domain, *, q: str, page: int, page_size: int
                sort: str | None, descending: bool) -> tuple[list[dict], int]:
     params = {"d": str(domain.id), "q": f"%{normalize(q)}%" if q else None,
               "limit": page_size, "offset": (page - 1) * page_size}
-    where = "s.domain_id = :d" + (" AND s.normalized_keyword LIKE :q" if q else "")
+    where = "s.domain_id = :d AND s.deleted_at IS NULL" + (" AND s.normalized_keyword LIKE :q" if q else "")
     total = db.execute(text(f"SELECT count(*) FROM saved_keywords s WHERE {where}"), params).scalar_one()
     col = SORTS.get(sort or "", "s.created_at")
     order = f"{col} {'DESC' if descending else 'ASC'} NULLS LAST, s.normalized_keyword"
@@ -122,6 +147,7 @@ def list_saved(db: Session, domain: Domain, *, q: str, page: int, page_size: int
                    (SELECT e.recorded_at FROM rank_entries e WHERE e.keyword_id = t.id ORDER BY e.recorded_at DESC LIMIT 1) AS recorded_at
             FROM tracked_keywords t
             WHERE t.domain_id = s.domain_id AND lower(t.term) = s.normalized_keyword
+              AND t.deleted_at IS NULL
             LIMIT 1
         ) r ON true
         WHERE {where}

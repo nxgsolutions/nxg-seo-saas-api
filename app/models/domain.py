@@ -16,10 +16,10 @@ from sqlalchemy import (
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
-from app.db.base import Base
+from app.db.base import Base, SoftDeleteMixin
 
 
-class Domain(Base):
+class Domain(Base, SoftDeleteMixin):
     __tablename__ = "domains"
     __table_args__ = (
         UniqueConstraint("workspace_id", "domain", name="uq_workspace_domain"),

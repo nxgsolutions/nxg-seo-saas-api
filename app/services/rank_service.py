@@ -2,7 +2,7 @@
 
 import uuid
 from dataclasses import dataclass
-from datetime import date
+from datetime import date, datetime
 
 from sqlalchemy import func, select, text
 from sqlalchemy.dialects.postgresql import insert as pg_insert
@@ -30,6 +30,12 @@ class KeywordSummary:
     search_volume: int | None = None
     difficulty: float | None = None
     intent: str | None = None
+    # Automated-tracking status (from the tracked_keywords row).
+    tracking_status: str = "idle"
+    tracking_enabled: bool = True
+    tracking_frequency_days: int = 15
+    last_fetched_at: datetime | None = None
+    next_fetch_at: datetime | None = None
 
 
 def _link_keyword_id(db: Session, term: str) -> uuid.UUID:
@@ -51,6 +57,21 @@ def _link_keyword_id(db: Session, term: str) -> uuid.UUID:
 
 def add_keyword(db: Session, domain: Domain, term: str) -> TrackedKeyword:
     term = term.strip()
+    # Reactivate a previously removed (soft-deleted) tracked keyword instead of
+    # hitting uq_domain_term; its rank history was preserved.
+    existing = db.execute(
+        select(TrackedKeyword).where(
+            TrackedKeyword.domain_id == domain.id,
+            TrackedKeyword.term == term,
+        ).execution_options(include_deleted=True)
+    ).scalar_one_or_none()
+    if existing is not None:
+        if existing.deleted_at is None:
+            raise KeywordExistsError(term)
+        existing.deleted_at = None
+        db.commit()
+        db.refresh(existing)
+        return existing
     kw = TrackedKeyword(
         domain_id=domain.id, term=term, keyword_id=_link_keyword_id(db, term)
     )
@@ -80,10 +101,29 @@ def get_keyword(
 
 
 def delete_keyword(db: Session, domain: Domain, keyword_id: str) -> bool:
+    """Soft-delete a tracked keyword (its rank_entries history is preserved)."""
     kw = get_keyword(db, domain, keyword_id)
     if kw is None:
         return False
-    db.delete(kw)
+    kw.deleted_at = func.now()
+    db.commit()
+    return True
+
+
+def restore_keyword(db: Session, domain: Domain, keyword_id: str) -> bool:
+    """Restore a soft-deleted tracked keyword. False if no such deleted row."""
+    try:
+        parsed = uuid.UUID(keyword_id)
+    except (ValueError, TypeError):
+        return False
+    kw = db.execute(
+        select(TrackedKeyword).where(
+            TrackedKeyword.id == parsed, TrackedKeyword.domain_id == domain.id
+        ).execution_options(include_deleted=True)
+    ).scalar_one_or_none()
+    if kw is None or kw.deleted_at is None:
+        return False
+    kw.deleted_at = None
     db.commit()
     return True
 
@@ -108,7 +148,7 @@ def _metrics_by_tracked(db: Session, domain: Domain) -> dict[uuid.UUID, dict]:
                 ORDER BY (km.search_volume IS NULL), km.metric_date DESC
                 LIMIT 1
             ) m ON true
-            WHERE t.domain_id = :d
+            WHERE t.domain_id = :d AND t.deleted_at IS NULL
             """
         ),
         {"d": str(domain.id)},
@@ -154,6 +194,11 @@ def list_keyword_summaries(
                 search_volume=m.get("search_volume"),
                 difficulty=m.get("difficulty"),
                 intent=m.get("intent"),
+                tracking_status=kw.tracking_status,
+                tracking_enabled=kw.tracking_enabled,
+                tracking_frequency_days=kw.tracking_frequency_days,
+                last_fetched_at=kw.last_fetched_at,
+                next_fetch_at=kw.next_fetch_at,
             )
         )
     return summaries
@@ -255,7 +300,7 @@ def sync_from_gsc(
     for kw in keywords:
         p = pos_map.get(kw.term.strip().lower())
         if p is not None:
-            record_position(db, kw, p, recorded_at)
+            record_position(db, kw, p, recorded_at, source="gsc")
             synced += 1
     return {"synced": synced, "total": len(keywords)}
 
@@ -318,8 +363,14 @@ def record_position(
     keyword: TrackedKeyword,
     position: int | None,
     recorded_at: date,
+    *,
+    url: str | None = None,
+    source: str = "serp",
 ) -> RankEntry:
-    """Upsert a position for a keyword on a given date."""
+    """Upsert a position for a keyword on a given date.
+
+    ``url`` is our ranking URL (from the SERP snapshot) and ``source`` records
+    where the position came from (serp | gsc | manual)."""
     existing = db.execute(
         select(RankEntry).where(
             RankEntry.keyword_id == keyword.id,
@@ -328,12 +379,16 @@ def record_position(
     ).scalar_one_or_none()
     if existing is not None:
         existing.position = position
+        if url is not None:
+            existing.url = url
+        existing.source = source
         db.commit()
         db.refresh(existing)
         return existing
 
     entry = RankEntry(
-        keyword_id=keyword.id, position=position, recorded_at=recorded_at
+        keyword_id=keyword.id, position=position, recorded_at=recorded_at,
+        url=url, source=source,
     )
     db.add(entry)
     db.commit()

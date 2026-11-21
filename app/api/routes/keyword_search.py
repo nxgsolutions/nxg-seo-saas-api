@@ -12,12 +12,13 @@ from app.api.deps import WorkspaceContext, get_workspace_context
 from app.api.errors import upstream_error
 from app.api.routes.keyword_analysis import _detail, _summary
 from app.db.session import get_db
+from app.models.domain import Domain
 from app.schemas.keyword_analysis import (
     OpportunityPoints, ResearchDetail, ResearchRequest, ResearchResultsPage, ResearchSummary,
 )
 from app.services.pagination import PageQuery, page_query, paginate
 from app.schemas.keyword_planner import KeywordPlannerRequest, KeywordPlannerResponse
-from app.services import keyword_analysis_service
+from app.services import domain_settings, keyword_analysis_service
 from app.services.keyword_planner_service import NotConfiguredError, PlannerError
 
 router = APIRouter(
@@ -33,10 +34,33 @@ def run_search(
     ctx: WorkspaceContext = Depends(get_workspace_context),
     db: Session = Depends(get_db),
 ) -> ResearchDetail:
+    # Optional active website: when supplied, the run is scoped to that domain so it
+    # pulls business/category-specific Keyword Planner ideas (and the domain's own
+    # market/language defaults). An unknown or other-workspace id is ignored (the
+    # search still runs, workspace-scoped) rather than failing.
+    domain = _resolve_domain(db, ctx, payload.domain_id)
+    country, language = payload.country, payload.language
+    if domain is not None and (country is None or language is None):
+        s = domain_settings.resolve(domain, ctx.workspace)
+        country = country or s.country
+        language = language or s.language
     research = keyword_analysis_service.run_research(
-        db, ctx.workspace, None, seed=payload.seed, country=payload.country, language=payload.language
+        db, ctx.workspace, domain, seed=payload.seed, country=country, language=language
     )
     return _detail(db, research, include_results=include_results)
+
+
+def _resolve_domain(db: Session, ctx: WorkspaceContext, domain_id: str | None) -> Domain | None:
+    """A managed domain in this workspace by id, or None (invalid/other-workspace)."""
+    if not domain_id:
+        return None
+    try:
+        domain = db.get(Domain, domain_id)
+    except Exception:  # noqa: BLE001 — a malformed id must not 500 a keyword search
+        return None
+    if domain is None or domain.workspace_id != ctx.workspace.id:
+        return None
+    return domain
 
 
 @router.post("/website", response_model=KeywordPlannerResponse, summary="Search by website (persisted)")

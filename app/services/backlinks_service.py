@@ -16,8 +16,10 @@ you (domain_intersection): 1 request.
 
 from __future__ import annotations
 
+import hashlib
+import random
 import re
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from sqlalchemy import delete, select, text
 from sqlalchemy.orm import Session
@@ -60,7 +62,7 @@ def estimated_cost(kind: str, env: str) -> float:
 def tracked_competitors(db: Session, domain: Domain) -> list[str]:
     """The domain's competitor list (oldest first), capped for the link gap."""
     rows = db.execute(
-        text("SELECT competitor FROM tracked_competitors WHERE domain_id = :d ORDER BY created_at, competitor"),
+        text("SELECT competitor FROM tracked_competitors WHERE domain_id = :d AND deleted_at IS NULL ORDER BY created_at, competitor"),
         {"d": str(domain.id)},
     ).scalars().all()
     return [norm_host(c) for c in rows][: settings.DATAFORSEO_BACKLINKS_MAX_COMPETITORS]
@@ -372,7 +374,7 @@ def options(db: Session, domain: Domain) -> dict:
     ours = norm_host(domain.domain)
     targets = [ours] + [c for c in tracked_competitors(db, domain) if c != ours]
     extra = [norm_host(c) for c in db.execute(
-        text("SELECT competitor FROM tracked_competitors WHERE domain_id = :d ORDER BY created_at"),
+        text("SELECT competitor FROM tracked_competitors WHERE domain_id = :d AND deleted_at IS NULL ORDER BY created_at"),
         {"d": str(domain.id)}).scalars()]
     targets += [c for c in extra if c not in targets]
     saved = {r.target: r.fetched_at for r in db.execute(
@@ -501,8 +503,39 @@ def anchor_mix(anchors: list[dict], brands: set[str], keywords: set[str]) -> dic
 
 def _target_keywords(db: Session, domain: Domain) -> set[str]:
     return {k for k in db.execute(
-        text("SELECT DISTINCT normalized_keyword FROM saved_keywords WHERE domain_id = :d"),
+        text("SELECT DISTINCT normalized_keyword FROM saved_keywords WHERE domain_id = :d AND deleted_at IS NULL"),
         {"d": str(domain.id)}).scalars() if k}
+
+
+_SANDBOX_TREND_WEEKS = 9
+
+
+def _sandbox_trend(latest: BacklinkRun, target: str) -> list[dict]:
+    """Synthesize a believable weekly growth curve for a sandbox demo when only
+    one run has been stored, so the Growth chart has something to show instead of
+    the "refresh again later" placeholder. The series ramps up to the latest
+    stored run's real values (its last point IS that run), so it ties to the KPIs
+    above the chart. Deterministic per target, so re-opening shows the same curve.
+    """
+    now = latest.fetched_at or datetime.now(timezone.utc)
+    rnd = random.Random(int(hashlib.sha256(target.encode()).hexdigest(), 16))
+    rd_end = latest.referring_domains or 0
+    bl_end = latest.backlinks or 0
+    weeks = _SANDBOX_TREND_WEEKS
+    start_frac = 0.60 + rnd.random() * 0.10  # start the curve at 60–70% of today
+    points: list[dict] = []
+    for i in range(weeks):
+        last = i == weeks - 1
+        frac = start_frac + (1 - start_frac) * (i / (weeks - 1))
+        jitter = 1.0 if last else 1 + (rnd.random() - 0.5) * 0.04
+        points.append({
+            "fetched_at": now - timedelta(weeks=weeks - 1 - i),
+            "rank": latest.rank if (last or latest.rank is None) else round(latest.rank * frac),
+            "backlinks": bl_end if last else round(bl_end * frac * jitter),
+            "referring_domains": rd_end if last else round(rd_end * frac * jitter),
+            "spam_score": latest.spam_score,
+        })
+    return points
 
 
 def analytics(db: Session, domain: Domain, target: str | None) -> dict:
@@ -521,6 +554,10 @@ def analytics(db: Session, domain: Domain, target: str | None) -> dict:
     out["trend"] = [{"fetched_at": r.fetched_at, "rank": r.rank, "backlinks": r.backlinks,
                      "referring_domains": r.referring_domains, "spam_score": r.spam_score}
                     for r in reversed(runs)]  # oldest -> newest for charting
+    # Sandbox has only one fetch, so there's no real history to chart. Fill in a
+    # synthetic growth curve ending at that run so the demo shows a real graph.
+    if env == data_env.SANDBOX and len(out["trend"]) < 2:
+        out["trend"] = _sandbox_trend(runs[0], target)
     payload = profile_payload(db, domain, target)
     s = payload["summary"] or {}
     d = details(db, domain, target)

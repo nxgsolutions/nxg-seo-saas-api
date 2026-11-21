@@ -292,6 +292,33 @@ def delete_domain(
 
 
 @router.post(
+    "/{workspace_id}/domains/{domain_id}/restore",
+    status_code=status.HTTP_204_NO_CONTENT,
+    summary="Restore a soft-deleted domain and all of its data (owner/admin)",
+    responses={
+        403: {"description": "Insufficient role"},
+        404: {"description": "Domain not found or not deleted"},
+    },
+)
+def restore_domain(
+    domain_id: str,
+    ctx: WorkspaceContext = Depends(get_workspace_context),
+    db: Session = Depends(get_db),
+) -> Response:
+    if ctx.role not in _MANAGER_ROLES:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Only the workspace owner or an admin can restore a domain.",
+        )
+    if not domain_service.restore_domain(db, ctx.workspace, domain_id):
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Domain not found or not deleted",
+        )
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+
+@router.post(
     "/{workspace_id}/page-audits",
     response_model=PageAuditDetail,
     status_code=status.HTTP_201_CREATED,

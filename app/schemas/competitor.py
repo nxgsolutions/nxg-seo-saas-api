@@ -170,23 +170,33 @@ class CompetitorListResponse(BaseModel):
 
 class CompetitorHistoryPoint(BaseModel):
     captured_on: date
-    avg_position: float
-    best_position: int
-    keywords_shared: int
+    # Whole-site analytics for this period's latest fetch (from the competitor
+    # analytics snapshots). A metric is null where that fetch lacked it.
+    est_traffic: int | None = None
+    ranking_keywords: int | None = None
+    domain_rank: int | None = None
+    traffic_share: float | None = None
 
 
 class CompetitorHistorySeries(BaseModel):
     competitor: str
+    is_you: bool = False
     points: list[CompetitorHistoryPoint]
 
 
 class CompetitorHistoryResponse(BaseModel):
     domain: str
     country: str
-    language: str
-    # Distinct captured_on dates (ascending) across the returned series.
+    # Frequency the points are bucketed into ("weekly" | "monthly").
+    freq: str = "weekly"
+    # Selected date range the series covers.
+    start: date
+    end: date
+    # Period-start dates (ascending) that actually have data (no zero-fill).
     dates: list[date]
     competitors: list[CompetitorHistorySeries]
+    # Whether any competitor has a record in the range (else show empty state).
+    has_data: bool = False
 
 
 class CompetitorRefreshResponse(BaseModel):
